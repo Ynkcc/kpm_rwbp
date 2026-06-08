@@ -1,0 +1,8 @@
+# 编译产生的中间目标文件
+*.o
+src/*.o
+tests/client/*.o
+tests/target/*.o
+
+# 编译统一输出目录
+out/
