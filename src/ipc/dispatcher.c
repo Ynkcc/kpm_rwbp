@@ -35,6 +35,20 @@ long rwbp_dispatch(shm_channel_t *shm)
             shm->data_size = (read_res >= 0) ? read_res : 0;
             return read_res;
         }
+        case OP_WRITE_MEM: {
+            write_memory_t wcmd;
+            memcpy(&wcmd, shm->payload, sizeof(write_memory_t));
+
+            pr_info("[kpm_RWBP] shm wcmd fields: pid=%u, addr=%llx, size=%llu\n",
+                    wcmd.pid, (unsigned long long)wcmd.addr, (unsigned long long)wcmd.size);
+
+            long write_res = write_process_memory(wcmd.pid, wcmd.addr,
+                                                  (const char *)wcmd.buffer, wcmd.size);
+            pr_info("[kpm_RWBP] write_process_memory return: %ld\n", write_res);
+
+            shm->data_size = 0;
+            return write_res;
+        }
         case OP_SET_HW_BREAKPOINT: {
             hw_breakpoint_cmd_t bcmd;
             memcpy(&bcmd, shm->payload, sizeof(hw_breakpoint_cmd_t));

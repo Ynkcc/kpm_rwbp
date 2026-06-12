@@ -9,15 +9,13 @@
 #endif
 
 #ifdef __USER_SPACE__
-#include <sys/ioctl.h>
-// 用户态通信重定向拦截
+// 用户态通信接口
 long kpm_ipc_cmd(int fd, unsigned int cmd, void *arg);
-#undef ioctl
-#define ioctl(fd, cmd, arg) kpm_ipc_cmd(fd, cmd, arg)
 #endif
 
 // Ioctl 命令定义，使用简单整数值以避免头文件冲突
 #define OP_READ_MEM                  8001
+#define OP_WRITE_MEM                 8002
 #define OP_SET_HW_BREAKPOINT         8011
 #define OP_REMOVE_HW_BREAKPOINT      8013
 #define OP_REMOVE_ALL_HW_BREAKPOINT  8014
@@ -31,6 +29,15 @@ typedef struct {
     uint64_t buffer;
     uint64_t size;
 } copy_memory_t;
+
+// 内存写入命令参数结构体
+typedef struct {
+    uint32_t pid;
+    uint32_t _pad0;
+    uint64_t addr;       // 目标进程虚拟地址
+    uint64_t buffer;     // 源数据用户态地址
+    uint64_t size;       // 写入大小
+} write_memory_t;
 
 // 硬件断点命令参数结构体
 typedef struct {
