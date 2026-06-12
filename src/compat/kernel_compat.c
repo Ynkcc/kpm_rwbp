@@ -24,12 +24,18 @@ int kfunc_def(sscanf)(const char *buf, const char *fmt, ...) = NULL;
 struct task_struct *kfunc_def(find_task_by_vpid)(pid_t nr) = NULL;
 pid_t (*kf___task_pid_nr_ns)(struct task_struct *task, enum pid_type type, struct pid_namespace *ns) = NULL;
 uint64_t kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, uint64_t n) = NULL;
+uint64_t kfunc_def(__arch_copy_from_user)(void *to, const void __user *from, uint64_t n) = NULL;
 int kfunc_def(sprint_symbol)(char *buffer, unsigned long address) = NULL;
 void kfunc_def(dump_stack)(void) = NULL;
 int kfunc_def(access_process_vm)(void *tsk, unsigned long addr, void *buf, int len, unsigned int gup_flags) = NULL;
 long kfunc_def(copy_from_user_nofault)(void *dst, const void __user *src, size_t size) = NULL;
 long kfunc_def(copy_to_user_nofault)(void *dst, const void *from, size_t size) = NULL;
 void *kfunc_def(memset)(void *s, int c, size_t n) = NULL;
+
+struct file *kfunc_def(anon_inode_getfile)(const char *name, const struct file_operations *fops, void *priv, int flags) = NULL;
+int kfunc_def(get_unused_fd_flags)(unsigned int flags) = NULL;
+void kfunc_def(put_unused_fd)(unsigned int fd) = NULL;
+void kfunc_def(fd_install)(unsigned int fd, struct file *file) = NULL;
 
 struct perf_event *kfunc_def(register_user_hw_breakpoint)(struct perf_event_attr *attr,
                                                          perf_overflow_handler_t triggered,
@@ -52,11 +58,7 @@ int kfunc_def(valid_phys_addr_range)(unsigned long addr, unsigned long size) = N
 int64_t kfunc_def(ktime_get_real_seconds)(void) = NULL;
 void kfunc_def(msleep)(unsigned int msecs) = NULL;
 
-// 匿名描述符与文件管理符号定义
-struct file *kfunc_def(anon_inode_getfile)(const char *name, const struct file_operations *fops, void *priv, int flags) = NULL;
-int kfunc_def(get_unused_fd_flags)(unsigned int flags) = NULL;
-void kfunc_def(put_unused_fd)(unsigned int fd) = NULL;
-void kfunc_def(fd_install)(unsigned int fd, struct file *file) = NULL;
+
 
 // 从 UTS_RELEASE 字符串解析内核版本
 static uint32_t parse_kernel_version(const char *release) {
@@ -100,6 +102,7 @@ long compat_init(void)
     kfunc_lookup_name(sscanf);
     kfunc_lookup_name(find_task_by_vpid);
     kfunc_lookup_name(__arch_copy_to_user);
+    kfunc_lookup_name(__arch_copy_from_user);
     kfunc_lookup_name(sprint_symbol);
     kfunc_lookup_name(dump_stack);
     kfunc_lookup_name(memset);
@@ -126,6 +129,7 @@ long compat_init(void)
     kfunc_lookup_name(get_unused_fd_flags);
     kfunc_lookup_name(put_unused_fd);
     kfunc_lookup_name(fd_install);
+
     kfunc_lookup_name(_raw_spin_lock_irqsave);
     kfunc_lookup_name(_raw_spin_unlock_irqrestore);
     kfunc_lookup_name(__task_pid_nr_ns);
@@ -169,17 +173,19 @@ long compat_init(void)
     }
 
     // 验证必需的内核符号
-    if (!kfunc(sscanf) || !kfunc(find_task_by_vpid) || !kfunc(__arch_copy_to_user) || 
-        !kfunc(sprint_symbol) || !kfunc(copy_from_user_nofault) || !kfunc(copy_to_user_nofault) ||
-        !kfunc(register_user_hw_breakpoint) || !kfunc(unregister_hw_breakpoint) || !kfunc(modify_user_hw_breakpoint) ||
-        !kfunc(perf_event_disable_inatomic) || !kfunc(perf_event_enable) || !kfunc(__kmalloc) || !kfunc(kfree) || 
-        !kfunc(queue_work_on) || !kf_system_wq ||
-        !kfunc(mmput) || !kfunc(get_task_mm) || !kfunc(pfn_valid) || !kfunc(valid_phys_addr_range) ||
-        !kfunc(ktime_get_real_seconds) || !kfunc(msleep) ||
-        !kfunc(anon_inode_getfile) || !kfunc(get_unused_fd_flags) || 
-        !kfunc(put_unused_fd) || !kfunc(fd_install) ||
-        !kfunc(_raw_spin_lock_irqsave) || !kfunc(_raw_spin_unlock_irqrestore) ||
-        !kfunc(__task_pid_nr_ns)) {
+    // 验证必需的内核符号 (由于 copy_from/to_user_nofault 在 4.14 上缺失，改为验证对应的兼容后端 __arch_copy_to/from_user 是否存在)
+    if (!kf_sscanf || !kf_find_task_by_vpid || !kf___arch_copy_to_user || !kf___arch_copy_from_user ||
+        !kf_sprint_symbol || 
+        !kf_register_user_hw_breakpoint || !kf_unregister_hw_breakpoint || !kf_modify_user_hw_breakpoint ||
+        !kf_perf_event_disable_inatomic || !kf_perf_event_enable || !kf___kmalloc || !kf_kfree || 
+        !kf_queue_work_on || !kf_system_wq ||
+        !kf_mmput || !kf_get_task_mm || !kf_pfn_valid || !kf_valid_phys_addr_range ||
+        !kf_ktime_get_real_seconds || !kf_msleep ||
+        !kf_anon_inode_getfile || !kf_get_unused_fd_flags ||
+        !kf_put_unused_fd || !kf_fd_install ||
+
+        !kf__raw_spin_lock_irqsave || !kf__raw_spin_unlock_irqrestore ||
+        !kf___task_pid_nr_ns) {
         pr_err("[kpm_RWBP] 动态查找核心内核符号失败！\n");
         return -ENOENT;
     }
@@ -191,3 +197,30 @@ long compat_init(void)
 
     return 0;
 }
+
+long compat_copy_to_user(void __user *to, const void *from, size_t size)
+{
+    if (kf___arch_copy_to_user) {
+        return kf___arch_copy_to_user(to, from, size);
+    }
+
+    if (kf_copy_to_user_nofault) {
+        return kf_copy_to_user_nofault(to, from, size);
+    }
+
+    return -ENOSYS;
+}
+
+long compat_copy_from_user(void *to, const void __user *from, size_t size)
+{
+    if (kf___arch_copy_from_user) {
+        return kf___arch_copy_from_user(to, from, size);
+    }
+
+    if (kf_copy_from_user_nofault) {
+        return kf_copy_from_user_nofault(to, from, size);
+    }
+
+    return -ENOSYS;
+}
+

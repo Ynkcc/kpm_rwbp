@@ -3,6 +3,10 @@
 #include <compiler.h>
 #include <kpmodule.h>
 #include <ksyms.h>
+#undef kfunc_lookup_name
+#define kfunc_lookup_name(func) \
+    kf_##func = (typeof(kf_##func))kallsyms_lookup_name(#func ".cfi_jt"); \
+    if (!kf_##func) kf_##func = (typeof(kf_##func))kallsyms_lookup_name(#func)
 #include <common.h>
 #include <linux/printk.h>
 
@@ -150,6 +154,9 @@ extern int kfunc_def(get_unused_fd_flags)(unsigned int flags);
 extern void kfunc_def(put_unused_fd)(unsigned int fd);
 extern void kfunc_def(fd_install)(unsigned int fd, struct file *file);
 
+// 兼容层运行时版本与状态变量
+
+
 // KernelPatch 版本宏（与标准 Linux kernel_version 编码兼容）
 // VERSION(major, minor, patch) = (major << 16) + (minor << 8) + patch
 #ifndef KERNEL_VERSION_CODE
@@ -169,7 +176,15 @@ extern void kfunc_def(fd_install)(unsigned int fd, struct file *file);
 extern uint64_t memstart_addr_val;
 extern uint64_t page_offset_val;
 
+// 运行时内核版本
+extern uint32_t kp_kernel_version;
+
+// 兼容层拷贝数据至用户态
+long compat_copy_to_user(void __user *to, const void *from, size_t size);
+long compat_copy_from_user(void *to, const void __user *from, size_t size);
+
 // 兼容层初始化，执行符号查找与动态偏移计算
 long compat_init(void);
 
 #endif // __KERNEL_COMPAT_H__
+

@@ -54,19 +54,26 @@ do_clean() {
 
 # ========== 推送 ==========
 do_push() {
-    info "推送产物到设备 (${DEVICE_DIR})..."
+    local serial="${DEVICE_SERIAL:-}"
+    local adb_cmd="adb"
+    if [[ -n "${serial}" ]]; then
+        adb_cmd="adb -s ${serial}"
+        info "推送产物到指定设备: ${serial} (${DEVICE_DIR})..."
+    else
+        info "推送产物到默认设备 (${DEVICE_DIR})..."
+    fi
 
     # 检查 adb 连接
-    adb devices | grep -q 'device$' || fail "未检测到 adb 设备连接"
+    ${adb_cmd} devices | grep -q 'device$' || fail "未检测到 adb 设备连接"
 
     local pushed=0
     for f in "${PUSH_FILES[@]}"; do
         local src="${OUT_DIR}/${f}"
         if [[ -f "${src}" ]]; then
-            adb push "${src}" "${DEVICE_DIR}/${f}"
+            ${adb_cmd} push "${src}" "${DEVICE_DIR}/${f}"
             # 可执行文件设置权限（.kpm 不需要）
             if [[ "${f}" != *.kpm ]]; then
-                adb shell "chmod +x ${DEVICE_DIR}/${f}"
+                ${adb_cmd} shell "chmod +x ${DEVICE_DIR}/${f}"
             fi
             pushed=$((pushed + 1))
         else
@@ -80,6 +87,7 @@ do_push() {
 
 # ========== 主逻辑 ==========
 cmd="${1:-all}"
+DEVICE_SERIAL="${2:-${ANDROID_SERIAL:-}}"
 
 case "${cmd}" in
     build)
@@ -97,7 +105,7 @@ case "${cmd}" in
         do_push
         ;;
     *)
-        echo "用法: $0 {build|push|clean|all}"
+        echo "用法: $0 {build|push|clean|all} [device_serial]"
         echo "  build  - 仅编译"
         echo "  push   - 仅推送到设备"
         echo "  clean  - 清理构建产物"

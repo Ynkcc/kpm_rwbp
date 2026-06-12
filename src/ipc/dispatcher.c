@@ -20,7 +20,7 @@ long rwbp_dispatch(unsigned int cmd, unsigned long arg)
             pr_info("[kpm_RWBP] calling copy_from_user_nofault from user arg=%lx...\n", arg);
             kfunc(msleep)(50);
 
-            long err = kfunc(copy_from_user_nofault)(&rcmd, (void __user *)arg, sizeof(rcmd));
+            long err = compat_copy_from_user(&rcmd, (void __user *)arg, sizeof(rcmd));
             pr_info("[kpm_RWBP] copy_from_user_nofault copy_memory_t result: %ld\n", err);
             kfunc(msleep)(50);
 
@@ -45,7 +45,7 @@ long rwbp_dispatch(unsigned int cmd, unsigned long arg)
             kfunc(msleep)(50);
 
             hw_breakpoint_cmd_t bcmd;
-            if (kfunc(copy_from_user_nofault)(&bcmd, (void __user *)arg, sizeof(bcmd)) != 0) {
+            if (compat_copy_from_user(&bcmd, (void __user *)arg, sizeof(bcmd)) != 0) {
                 return -EFAULT;
             }
             return register_hwbp(bcmd.pid, bcmd.addr, bcmd.type, bcmd.len, bcmd.scheme);
@@ -55,7 +55,7 @@ long rwbp_dispatch(unsigned int cmd, unsigned long arg)
             kfunc(msleep)(50);
 
             hw_breakpoint_cmd_t bcmd;
-            if (kfunc(copy_from_user_nofault)(&bcmd, (void __user *)arg, sizeof(bcmd)) != 0) {
+            if (compat_copy_from_user(&bcmd, (void __user *)arg, sizeof(bcmd)) != 0) {
                 return -EFAULT;
             }
             return unregister_hwbp(bcmd.pid, bcmd.addr);
@@ -70,7 +70,7 @@ long rwbp_dispatch(unsigned int cmd, unsigned long arg)
             kfunc(msleep)(50);
 
             hwbp_info_cmd_t icmd;
-            if (kfunc(copy_from_user_nofault)(&icmd, (void __user *)arg, sizeof(icmd)) != 0) {
+            if (compat_copy_from_user(&icmd, (void __user *)arg, sizeof(icmd)) != 0) {
                 return -EFAULT;
             }
 
@@ -79,7 +79,7 @@ long rwbp_dispatch(unsigned int cmd, unsigned long arg)
                                       (void __user *)icmd.user_buf, &actual_count);
             if (ret == 0) {
                 // 将实际数量拷贝回用户空间
-                if (kfunc(copy_to_user_nofault)((void __user *)(arg + offsetof(hwbp_info_cmd_t, actual_count)),
+                if (compat_copy_to_user((void __user *)(arg + offsetof(hwbp_info_cmd_t, actual_count)),
                                         &actual_count, sizeof(actual_count)) != 0) {
                     return -EFAULT;
                 }
