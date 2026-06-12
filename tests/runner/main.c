@@ -7,6 +7,9 @@
 #include <signal.h>
 #include "kpm_ctrl.h"
 #include "case_mem_read.h"
+#include "case_mem_write.h"
+#include "case_mem_list.h"
+#include "case_mem_array.h"
 #include "case_hwbp_self.h"
 #include "../include/supercall.h"
 
@@ -22,7 +25,7 @@ typedef struct {
 static void print_usage(const char *prog)
 {
     printf("用法: %s [OPTIONS]\n", prog);
-    printf("  --case <name>     all | mem | hwbp-self | hwbp-target  (默认: all)\n");
+    printf("  --case <name>     all | mem | mem-write | mem-list | mem-array | hwbp-self | hwbp-target  (默认: all)\n");
     printf("  --scheme <n>      HWBP 方案 1-4，0=全部运行  (默认: 0)\n");
     printf("  --timeout <ms>    单个断点方案超时时间 ms  (默认: 3000)\n");
     printf("  --no-dmesg        禁用 dmesg 日志同步进程\n");
@@ -119,15 +122,42 @@ int main(int argc, char *argv[])
     test_result_t results[MAX_RESULTS];
     int result_count = 0;
 
-    bool do_mem    = (strcmp(run_case, "all") == 0 || strcmp(run_case, "mem") == 0);
-    bool do_self   = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-self") == 0);
-    bool do_target = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-target") == 0);
+    bool do_mem      = (strcmp(run_case, "all") == 0 || strcmp(run_case, "mem") == 0);
+    bool do_mem_write = (strcmp(run_case, "all") == 0 || strcmp(run_case, "mem-write") == 0);
+    bool do_mem_list  = (strcmp(run_case, "all") == 0 || strcmp(run_case, "mem-list") == 0);
+    bool do_mem_array = (strcmp(run_case, "all") == 0 || strcmp(run_case, "mem-array") == 0);
+    bool do_self      = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-self") == 0);
+    bool do_target    = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-target") == 0);
 
     // case: mem_read
     if (do_mem) {
         printf("[*] ========== 运行 case: mem_read ==========\n");
         bool ok = run_case_mem_read(anon_fd);
         results[result_count++] = (test_result_t){ "mem_read", ok };
+        printf("\n");
+    }
+
+    // case: mem_write
+    if (do_mem_write) {
+        printf("[*] ========== 运行 case: mem_write ==========\n");
+        bool ok = run_case_mem_write(anon_fd);
+        results[result_count++] = (test_result_t){ "mem_write", ok };
+        printf("\n");
+    }
+
+    // case: mem_list
+    if (do_mem_list) {
+        printf("[*] ========== 运行 case: mem_list ==========\n");
+        bool ok = run_case_mem_list(anon_fd);
+        results[result_count++] = (test_result_t){ "mem_list", ok };
+        printf("\n");
+    }
+
+    // case: mem_array
+    if (do_mem_array) {
+        printf("[*] ========== 运行 case: mem_array ==========\n");
+        bool ok = run_case_mem_array(anon_fd);
+        results[result_count++] = (test_result_t){ "mem_array", ok };
         printf("\n");
     }
 

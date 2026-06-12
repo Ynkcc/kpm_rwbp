@@ -4,7 +4,6 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/signal.h>
 #include <sys/time.h>
@@ -290,7 +289,7 @@ bool run_case_hwbp_target(int anon_fd, int scheme)
            scheme, (unsigned long long)bcmd.addr);
     fflush(stdout);
 
-    long ret = ioctl(anon_fd, OP_SET_HW_BREAKPOINT, &bcmd);
+    long ret = kpm_ipc_cmd(anon_fd, OP_SET_HW_BREAKPOINT, &bcmd);
     printf("%s [hwbp_target] HWBP 注册返回: %ld\n", ret == 0 ? "[+]" : "[-]", ret);
     fflush(stdout);
 
@@ -316,9 +315,9 @@ bool run_case_hwbp_target(int anon_fd, int scheme)
         icmd.max_count = MAX_HIT_RECORDS;
         icmd.user_buf = (uint64_t)hits;
         
-        ret = ioctl(anon_fd, OP_READ_HW_BP_INFO, &icmd);
+        ret = kpm_ipc_cmd(anon_fd, OP_READ_HW_BP_INFO, &icmd);
         if (ret != 0) {
-            printf("[-] [hwbp_target] OP_READ_HW_BP_INFO ioctl 失败, ret=%ld, errno=%d\n", ret, errno);
+            printf("[-] [hwbp_target] OP_READ_HW_BP_INFO kpm_ipc_cmd 失败, ret=%ld, errno=%d\n", ret, errno);
             fflush(stdout);
         }
         if (ret == 0 && icmd.actual_count > 0) {
@@ -395,7 +394,7 @@ static bool _run_scheme(int anon_fd, int scheme, int timeout_ms)
         bcmd.len    = 8;
         bcmd.scheme = scheme;
 
-        long ret = ioctl(anon_fd, OP_SET_HW_BREAKPOINT, &bcmd);
+        long ret = kpm_ipc_cmd(anon_fd, OP_SET_HW_BREAKPOINT, &bcmd);
         if (ret != 0) {
             printf("[-] [hwbp_self] 方案 %d: 断点注册失败, ret=%ld\n", scheme, ret);
             _exit(1);
@@ -414,7 +413,7 @@ static bool _run_scheme(int anon_fd, int scheme, int timeout_ms)
                scheme, (unsigned long long)(*ptr));
         fflush(stdout);
 
-        ioctl(anon_fd, OP_REMOVE_HW_BREAKPOINT, &bcmd);
+        kpm_ipc_cmd(anon_fd, OP_REMOVE_HW_BREAKPOINT, &bcmd);
         _exit(0);
     }
 

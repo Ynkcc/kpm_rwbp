@@ -71,6 +71,10 @@ long kpm_ipc_cmd(int fd, unsigned int cmd, void *arg)
         copy_memory_t *rcmd = (copy_memory_t *)arg;
         memcpy(g_shm->payload, rcmd, sizeof(copy_memory_t));
     }
+    else if (cmd == OP_WRITE_MEM) {
+        write_memory_t *wcmd = (write_memory_t *)arg;
+        memcpy(g_shm->payload, wcmd, sizeof(write_memory_t));
+    }
     else if (cmd == OP_SET_HW_BREAKPOINT || cmd == OP_REMOVE_HW_BREAKPOINT) {
         hw_breakpoint_cmd_t *bcmd = (hw_breakpoint_cmd_t *)arg;
         memcpy(g_shm->payload, bcmd, sizeof(hw_breakpoint_cmd_t));
@@ -107,4 +111,81 @@ long kpm_ipc_cmd(int fd, unsigned int cmd, void *arg)
     }
 
     return retval;
+}
+
+// ============================================================================
+// 便捷封装函数
+// ============================================================================
+
+// 内存写入
+long kpm_write_mem(uint32_t pid, uint64_t vaddr, const void *buffer, uint64_t size)
+{
+    write_memory_t wcmd = {
+        .pid = pid,
+        ._pad0 = 0,
+        .addr = vaddr,
+        .buffer = (uint64_t)buffer,
+        .size = size
+    };
+    return kpm_ipc_cmd(-1, OP_WRITE_MEM, &wcmd);
+}
+
+// 内存读取
+long kpm_read_mem(uint32_t pid, uint64_t vaddr, void *dest, uint64_t size)
+{
+    copy_memory_t rcmd = {
+        .pid = pid,
+        ._pad0 = 0,
+        .addr = vaddr,
+        .buffer = (uint64_t)dest,
+        .size = size
+    };
+    return kpm_ipc_cmd(-1, OP_READ_MEM, &rcmd);
+}
+
+// 内存链表读取
+long kpm_read_mem_list(uint32_t pid, uint64_t base_addr, const uint64_t *addrs, uint64_t count,
+                       void *dest, uint64_t size)
+{
+    uint64_t current_base = base_addr;
+    long total_read = 0;
+
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t offset = addrs[i];
+
+        if (offset == (uint64_t)-1) {
+            break;
+        }
+
+        if (i + 1 >= count) {
+            // 最后一项：读取实际数据
+            long ret = kpm_read_mem(pid, current_base + offset, dest, size);
+            if (ret <= 0) {
+                break;
+            }
+            total_read += ret;
+            break;
+        } else {
+            // 中间项：读取指针
+            uint64_t next_ptr = 0;
+            long ret = kpm_read_mem(pid, current_base + offset, &next_ptr, sizeof(next_ptr));
+            if (ret != sizeof(next_ptr)) {
+                break;
+            }
+            // 考虑 40 位虚拟地址掩码
+            current_base = next_ptr & 0xFFFFFFFFFFULL;
+            if (!current_base || current_base == 0xFFFFFFFFFFULL) {
+                break;
+            }
+        }
+    }
+    return total_read > 0 ? total_read : -1;
+}
+
+// 内存数组读取
+long kpm_read_mem_array(uint32_t pid, uint64_t array_vaddr, uint64_t count,
+                        void *dest, uint64_t item_size)
+{
+    // 在用户态，数组是连续分布的，仅需一次读取即可
+    return kpm_read_mem(pid, array_vaddr, dest, count * item_size);
 }

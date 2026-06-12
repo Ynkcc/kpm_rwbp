@@ -4,7 +4,6 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <sys/ioctl.h>
 #include <errno.h>
 #include "case_mem_read.h"
 #include "dispatcher.h"
@@ -35,7 +34,7 @@ bool run_case_mem_read(int anon_fd)
     rcmd.buffer = (uint64_t)malloc(sizeof(test_value));
     rcmd.size   = sizeof(test_value);
 
-    long ret = ioctl(anon_fd, OP_READ_MEM, &rcmd);
+    long ret = kpm_ipc_cmd(anon_fd, OP_READ_MEM, &rcmd);
     if (ret < 0) {
         printf("[-] [mem_read] int 读取 ioctl 失败, errno=%d\n", errno);
         all_pass = false;
@@ -62,7 +61,7 @@ bool run_case_mem_read(int anon_fd)
     printf("[*] [mem_read] 批量读取 %zu 字节: \"%s\"\n", sizeof(test_pattern), test_pattern);
     fflush(stdout);
 
-    ret = ioctl(anon_fd, OP_READ_MEM, &bulk);
+    ret = kpm_ipc_cmd(anon_fd, OP_READ_MEM, &bulk);
     if (ret < 0) {
         printf("[-] [mem_read] 批量 ioctl 失败, errno=%d\n", errno);
         all_pass = false;
