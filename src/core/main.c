@@ -27,42 +27,7 @@ struct file_lock;
 struct pipe_inode_info;
 struct io_uring_cmd;
 
-// 完全对齐 Linux 6.6 内核的 file_operations 伪声明
-struct file_operations {
-    void *owner;
-    long long (*llseek) (struct file *, long long, int);
-    long (*read) (struct file *, char *, unsigned long, long long *);
-    long (*write) (struct file *, const char *, unsigned long, long long *);
-    long (*read_iter) (struct kiocb *, struct iov_iter *);
-    long (*write_iter) (struct kiocb *, struct iov_iter *);
-    int (*iopoll)(struct kiocb *, struct io_comp_batch *, unsigned int);
-    int (*iterate_shared) (struct file *, struct dir_context *);
-    unsigned int (*poll) (struct file *, struct poll_table_struct *);
-    long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long);
-    long (*compat_ioctl) (struct file *, unsigned int, unsigned long);
-    int (*mmap) (struct file *, struct vm_area_struct *);
-    unsigned long mmap_supported_flags;
-    int (*open) (struct inode *, struct file *);
-    int (*flush) (struct file *, void *id);
-    int (*release) (struct inode *, struct file *);
-    int (*fsync) (struct file *, long long, long long, int);
-    int (*fasync) (int, struct file *, int);
-    int (*lock) (struct file *, int, struct file_lock *);
-    unsigned long (*get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
-    int (*check_flags)(int);
-    int (*flock) (struct file *, int, struct file_lock *);
-    long (*splice_write)(struct pipe_inode_info *, struct file *, long long *, unsigned long, unsigned int);
-    long (*splice_read)(struct file *, long long *, struct pipe_inode_info *, unsigned long, unsigned int);
-    void (*splice_eof)(struct file *);
-    int (*setlease)(struct file *, int, struct file_lock **, void **);
-    long (*fallocate)(struct file *, int, long long, long long);
-    void (*show_fdinfo)(struct seq_file *, struct file *);
-    unsigned long (*copy_file_range)(struct file *, long long, struct file *, long long, unsigned long, unsigned int);
-    long long (*remap_file_range)(struct file *, long long, struct file *, long long, long long, unsigned int);
-    int (*fadvise)(struct file *, long long, long long, int);
-    int (*uring_cmd)(struct io_uring_cmd *, unsigned int);
-    int (*uring_cmd_iopoll)(struct io_uring_cmd *, struct io_comp_batch *, unsigned int);
-};
+
 
 #define syscall_set_retval(args, val) ((args)->ret = (val))
 #define syscall_set_handled(args, handled) ((args)->skip_origin = (handled))
@@ -74,6 +39,14 @@ KPM_LICENSE("GPL v2");
 KPM_AUTHOR("ynk");
 KPM_DESCRIPTION("Kernel Memory Reader & HWBP KPM (Refactored)");
 
+// 共享内存通道用户态虚拟地址
+static unsigned long shm_user_vaddr = 0;
+
+// 自动清理共享内存通道
+static void cleanup_shm_channel(void) {
+    shm_user_vaddr = 0;
+}
+
 // 控制端进程指针
 static void *current_control_task = NULL;
 
@@ -81,22 +54,10 @@ static void *current_control_task = NULL;
 void handle_cleanup(void) {
     pr_info("[kpm_RWBP] 控制端进程已退出，开始自动清理内核资源...\n");
     unregister_all_hwbp();
+    cleanup_shm_channel();
 }
 
-// 匿名 FD 绑定的 ioctl 执行函数
-static long anon_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
-    pr_info("[kpm_RWBP] anon_ioctl called: file=%p, cmd=%u, arg=%lx\n", file, cmd, arg);
-    kfunc(msleep)(50);
-    return rwbp_dispatch(cmd, arg);
-}
-
-// 匿名文件操作结构体
-static struct file_operations anon_fops = {
-    .unlocked_ioctl = anon_ioctl,
-    .compat_ioctl = anon_ioctl,
-};
-
-// 引导阶段系统调用 Hook 拦截器
+// 引导与敲门事件系统调用 Hook 拦截器
 static void rwbp_fstatfs_hook(hook_fargs2_t *args, void *udata) {
     uint64_t arg0 = syscall_argn(args, 0);
     uint64_t arg1 = syscall_argn(args, 1);
@@ -109,30 +70,48 @@ static void rwbp_fstatfs_hook(hook_fargs2_t *args, void *udata) {
     // 2. 校验特权用户
     struct cred *cred = *(struct cred **)((uintptr_t)current + task_struct_offset.cred_offset);
     uid_t caller_uid = *(uid_t *)((uintptr_t)cred + cred_offset.uid_offset);
-    
-    int64_t current_timestamp = kfunc(ktime_get_real_seconds)();
-    int64_t received_timestamp = (int64_t)arg0;
-    int64_t diff = current_timestamp - received_timestamp;
-
-    pr_info("[kpm_RWBP] fstatfs_hook matched: uid=%d, diff=%lld, arg0=%llx\n", (int)caller_uid, (long long)diff, (unsigned long long)arg0);
-
-    if (diff < -3 || diff > 3) {
+    if (caller_uid != 0) {
         return;
     }
 
-    // 4. 生成匿名描述符并注入当前进程
-    int fd = kfunc(get_unused_fd_flags)(0);
-    if (fd >= 0) {
-        struct file *file = kfunc(anon_inode_getfile)("rwbp_anon", &anon_fops, NULL, 0);
-        if (!IS_ERR(file)) {
-            kfunc(fd_install)(fd, file);
+    // 3. 通信分支逻辑：握手绑定阶段 vs 事件执行阶段
+    if (shm_user_vaddr == 0) {
+        pr_info("[kpm_RWBP] 收到共享内存通道握手请求，用户虚拟地址: 0x%llx\n", (unsigned long long)arg0);
+        uint32_t magic_val = 0;
+        
+        // 尝试从用户空间虚拟地址读取 magic，以校验合法性
+        long err = compat_copy_from_user(&magic_val, (void __user *)arg0, sizeof(uint32_t));
+        if (err == 0 && magic_val == SHM_MAGIC) {
+            shm_user_vaddr = (unsigned long)arg0;
             current_control_task = get_current(); // 记录控制进程
-            syscall_set_retval(args, fd);
+            syscall_set_retval(args, 0);          // 返回 0 告知握手成功
             syscall_set_handled(args, true);
-            pr_info("[kpm_RWBP] 成功为控制进程 PID %d 注入匿名控制 FD %d\n", (int)syscall_argn(args, 0), fd);
+            pr_info("[kpm_RWBP] 成功绑定共享内存通道，虚拟地址: 0x%lx\n", shm_user_vaddr);
         } else {
-            kfunc(put_unused_fd)(fd);
+            pr_warn("[kpm_RWBP] 共享内存 Magic 校验失败！magic=0x%x, err=%ld\n", magic_val, err);
+            syscall_set_retval(args, -EINVAL);
+            syscall_set_handled(args, true);
         }
+    } else {
+
+        // 使用局部栈缓冲区做指令交互
+        shm_channel_t local_shm;
+        long err = compat_copy_from_user(&local_shm, (void __user *)shm_user_vaddr, sizeof(shm_channel_t));
+        if (err == 0) {
+            if (local_shm.status == 1) {
+                local_shm.status = 2; // 处理中
+                long ret = rwbp_dispatch(&local_shm);
+                local_shm.retval = (int32_t)ret;
+                local_shm.status = 0; // 处理完成
+                // 写回用户态
+                compat_copy_to_user((void __user *)shm_user_vaddr, &local_shm, sizeof(shm_channel_t));
+            }
+        } else {
+            pr_warn("[kpm_RWBP] 读取用户态共享内存失败: err=%ld\n", err);
+        }
+
+        syscall_set_retval(args, 0);
+        syscall_set_handled(args, true);
     }
 }
 

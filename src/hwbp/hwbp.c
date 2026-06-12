@@ -888,7 +888,15 @@ long read_hwbp_info(uint32_t pid, uint64_t max_count, void __user *user_buf, uin
                 uint32_t idx = (head + MAX_HIT_RECORDS_PER_BP - count + i) % MAX_HIT_RECORDS_PER_BP;
                 struct bp_hit_record *rec = &pos->hit_records[idx];
                 
-                if (kfunc(copy_to_user_nofault)(user_buf + total_copied * sizeof(struct bp_hit_record), rec, sizeof(struct bp_hit_record)) != 0) {
+                void *dst = user_buf + total_copied * sizeof(struct bp_hit_record);
+                long copy_err;
+                if ((uintptr_t)dst >= 0xffff000000000000ULL) {
+                    memcpy(dst, rec, sizeof(struct bp_hit_record));
+                    copy_err = 0;
+                } else {
+                    copy_err = kfunc(copy_to_user_nofault)(dst, rec, sizeof(struct bp_hit_record));
+                }
+                if (copy_err != 0) {
                     spin_unlock_irqrestore(&pos->hit_records_lock, rec_flags);
                     spin_unlock_irqrestore(&bp_list_lock, flags);
                     return -EFAULT;

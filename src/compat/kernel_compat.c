@@ -32,10 +32,7 @@ long kfunc_def(copy_from_user_nofault)(void *dst, const void __user *src, size_t
 long kfunc_def(copy_to_user_nofault)(void *dst, const void *from, size_t size) = NULL;
 void *kfunc_def(memset)(void *s, int c, size_t n) = NULL;
 
-struct file *kfunc_def(anon_inode_getfile)(const char *name, const struct file_operations *fops, void *priv, int flags) = NULL;
-int kfunc_def(get_unused_fd_flags)(unsigned int flags) = NULL;
-void kfunc_def(put_unused_fd)(unsigned int fd) = NULL;
-void kfunc_def(fd_install)(unsigned int fd, struct file *file) = NULL;
+
 
 struct perf_event *kfunc_def(register_user_hw_breakpoint)(struct perf_event_attr *attr,
                                                          perf_overflow_handler_t triggered,
@@ -125,10 +122,7 @@ long compat_init(void)
     kfunc_lookup_name(valid_phys_addr_range);
     kfunc_lookup_name(ktime_get_real_seconds);
     kfunc_lookup_name(msleep);
-    kfunc_lookup_name(anon_inode_getfile);
-    kfunc_lookup_name(get_unused_fd_flags);
-    kfunc_lookup_name(put_unused_fd);
-    kfunc_lookup_name(fd_install);
+
 
     kfunc_lookup_name(_raw_spin_lock_irqsave);
     kfunc_lookup_name(_raw_spin_unlock_irqrestore);
@@ -181,8 +175,7 @@ long compat_init(void)
         !kf_queue_work_on || !kf_system_wq ||
         !kf_mmput || !kf_get_task_mm || !kf_pfn_valid || !kf_valid_phys_addr_range ||
         !kf_ktime_get_real_seconds || !kf_msleep ||
-        !kf_anon_inode_getfile || !kf_get_unused_fd_flags ||
-        !kf_put_unused_fd || !kf_fd_install ||
+
 
         !kf__raw_spin_lock_irqsave || !kf__raw_spin_unlock_irqrestore ||
         !kf___task_pid_nr_ns) {

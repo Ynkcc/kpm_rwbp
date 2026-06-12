@@ -3,7 +3,7 @@
 #include <linux/sched.h>
 #include <linux/mm_types.h>
 #include <linux/errno.h>
-
+#include <linux/string.h>
 // 核心读取函数 - 基于 access_process_vm 的稳健读取方案
 long read_process_memory(uint32_t pid, uint64_t vaddr, uint64_t size, char *__user out_msg)
 {
@@ -34,10 +34,16 @@ long read_process_memory(uint32_t pid, uint64_t vaddr, uint64_t size, char *__us
             break;
         }
 
-        // 安全拷贝到控制进程用户空间
-        long copy_err = compat_copy_to_user((void __user *)cur_outbuf, kbuf, read_bytes);
-        if (copy_err < 0) {
-            copy_err = read_bytes;
+        // 安全拷贝到控制进程用户空间或内核共享内存
+        long copy_err;
+        if (cur_outbuf >= 0xffff000000000000ULL) {
+            memcpy((void *)cur_outbuf, kbuf, read_bytes);
+            copy_err = 0;
+        } else {
+            copy_err = compat_copy_to_user((void __user *)cur_outbuf, kbuf, read_bytes);
+            if (copy_err < 0) {
+                copy_err = read_bytes;
+            }
         }
 
         int copied = read_bytes - copy_err;

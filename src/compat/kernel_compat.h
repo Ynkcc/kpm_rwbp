@@ -94,11 +94,11 @@ struct perf_event_attr {
     uint64_t bp_addr;            // 56
     uint64_t bp_len;             // 64
     
-    // 关键修正：branch_sample_type 和 sample_regs_user 实际上是共享同一偏移量的 union
-    union {
-        uint64_t branch_sample_type; // 72
-        uint64_t sample_regs_user;   // 72
-    };
+    // 4.14/4.19: branch_sample_type 和 sample_regs_user 是分开的字段
+    // 6.x+: branch_sample_type 被移除，新增 ksymbol, bpf_event 等标志位
+    // 以下结构体布局兼容 4.14/4.19 (size=112)
+    uint64_t branch_sample_type;     // 72 (4.14/4.19)
+    uint64_t sample_regs_user;       // 80 (4.14/4.19)
     uint32_t sample_stack_user;  // 80
     int32_t  clockid;            // 84
     uint64_t sample_regs_intr;   // 88
@@ -146,13 +146,7 @@ extern int kfunc_def(valid_phys_addr_range)(unsigned long addr, unsigned long si
 extern int64_t kfunc_def(ktime_get_real_seconds)(void);
 extern void kfunc_def(msleep)(unsigned int msecs);
 
-// 新增匿名描述符与文件关联符号
-struct file;
-struct file_operations;
-extern struct file *kfunc_def(anon_inode_getfile)(const char *name, const struct file_operations *fops, void *priv, int flags);
-extern int kfunc_def(get_unused_fd_flags)(unsigned int flags);
-extern void kfunc_def(put_unused_fd)(unsigned int fd);
-extern void kfunc_def(fd_install)(unsigned int fd, struct file *file);
+
 
 // 兼容层运行时版本与状态变量
 

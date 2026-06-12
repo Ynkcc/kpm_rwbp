@@ -3,93 +3,70 @@
 #include "mem_reader.h"
 #include "hwbp.h"
 #include <linux/errno.h>
-#include <linux/uaccess.h>
+#include <linux/string.h>
 
-long rwbp_dispatch(unsigned int cmd, unsigned long arg)
+long rwbp_dispatch(shm_channel_t *shm)
 {
-    pr_info("[kpm_RWBP] rwbp_dispatch entry: cmd=%u, arg=%lx\n", cmd, arg);
-    kfunc(msleep)(50);
+    if (!shm || shm->magic != SHM_MAGIC) {
+        pr_warn("[kpm_RWBP] rwbp_dispatch: Invalid SHM magic or pointer!\n");
+        return -EINVAL;
+    }
 
-    // 根据 IOCTL 命令分发处理
+    unsigned int cmd = shm->cmd;
+    pr_info("[kpm_RWBP] rwbp_dispatch shm entry: cmd=%u\n", cmd);
+
+    // 根据命令分发处理
     switch (cmd) {
         case OP_READ_MEM: {
-            pr_info("[kpm_RWBP] rwbp_dispatch: OP_READ_MEM\n");
-            kfunc(msleep)(50);
-
             copy_memory_t rcmd;
-            pr_info("[kpm_RWBP] calling copy_from_user_nofault from user arg=%lx...\n", arg);
-            kfunc(msleep)(50);
+            // 拷贝入参，防止后续覆盖冲突
+            memcpy(&rcmd, shm->payload, sizeof(copy_memory_t));
 
-            long err = compat_copy_from_user(&rcmd, (void __user *)arg, sizeof(rcmd));
-            pr_info("[kpm_RWBP] copy_from_user_nofault copy_memory_t result: %ld\n", err);
-            kfunc(msleep)(50);
+            pr_info("[kpm_RWBP] shm rcmd fields: pid=%u, addr=%llx, size=%llu\n",
+                    rcmd.pid, (unsigned long long)rcmd.addr, (unsigned long long)rcmd.size);
 
-            if (err != 0) {
-                pr_warn("[kpm_RWBP] copy_from_user_nofault failed!\n");
-                kfunc(msleep)(50);
-                return -EFAULT;
+            if (rcmd.size > sizeof(shm->payload)) {
+                return -EINVAL;
             }
 
-            pr_info("[kpm_RWBP] rcmd fields: pid=%u, addr=%llx, buffer=%llx, size=%llu\n",
-                    rcmd.pid, (unsigned long long)rcmd.addr, (unsigned long long)rcmd.buffer, (unsigned long long)rcmd.size);
-            kfunc(msleep)(50);
-
-            long read_res = read_process_memory(rcmd.pid, rcmd.addr, rcmd.size, (char __user *)rcmd.buffer);
+            long read_res = read_process_memory(rcmd.pid, rcmd.addr, rcmd.size, (char *)shm->payload);
             pr_info("[kpm_RWBP] read_process_memory return: %ld\n", read_res);
-            kfunc(msleep)(50);
 
+            shm->data_size = (read_res >= 0) ? read_res : 0;
             return read_res;
         }
         case OP_SET_HW_BREAKPOINT: {
-            pr_info("[kpm_RWBP] rwbp_dispatch: OP_SET_HW_BREAKPOINT\n");
-            kfunc(msleep)(50);
-
             hw_breakpoint_cmd_t bcmd;
-            if (compat_copy_from_user(&bcmd, (void __user *)arg, sizeof(bcmd)) != 0) {
-                return -EFAULT;
-            }
+            memcpy(&bcmd, shm->payload, sizeof(hw_breakpoint_cmd_t));
             return register_hwbp(bcmd.pid, bcmd.addr, bcmd.type, bcmd.len, bcmd.scheme);
         }
         case OP_REMOVE_HW_BREAKPOINT: {
-            pr_info("[kpm_RWBP] rwbp_dispatch: OP_REMOVE_HW_BREAKPOINT\n");
-            kfunc(msleep)(50);
-
             hw_breakpoint_cmd_t bcmd;
-            if (compat_copy_from_user(&bcmd, (void __user *)arg, sizeof(bcmd)) != 0) {
-                return -EFAULT;
-            }
+            memcpy(&bcmd, shm->payload, sizeof(hw_breakpoint_cmd_t));
             return unregister_hwbp(bcmd.pid, bcmd.addr);
         }
         case OP_REMOVE_ALL_HW_BREAKPOINT: {
-            pr_info("[kpm_RWBP] rwbp_dispatch: OP_REMOVE_ALL_HW_BREAKPOINT\n");
-            kfunc(msleep)(50);
             return unregister_all_hwbp();
         }
         case OP_READ_HW_BP_INFO: {
-            pr_info("[kpm_RWBP] rwbp_dispatch: OP_READ_HW_BP_INFO\n");
-            kfunc(msleep)(50);
-
             hwbp_info_cmd_t icmd;
-            if (compat_copy_from_user(&icmd, (void __user *)arg, sizeof(icmd)) != 0) {
-                return -EFAULT;
-            }
+            memcpy(&icmd, shm->payload, sizeof(hwbp_info_cmd_t));
 
             uint64_t actual_count = 0;
-            long ret = read_hwbp_info(icmd.pid, icmd.max_count,
-                                      (void __user *)icmd.user_buf, &actual_count);
+            // 直接读取命中数据覆盖写入 payload，最大数量由 icmd.max_count 限制，且不能超过 payload 大小
+            uint64_t max_allowed = sizeof(shm->payload) / 296; // 296 = sizeof(hwbp_hit_item_t)
+            uint64_t request_count = (icmd.max_count > max_allowed) ? max_allowed : icmd.max_count;
+
+            long ret = read_hwbp_info(icmd.pid, request_count, (void *)shm->payload, &actual_count);
             if (ret == 0) {
-                // 将实际数量拷贝回用户空间
-                if (compat_copy_to_user((void __user *)(arg + offsetof(hwbp_info_cmd_t, actual_count)),
-                                        &actual_count, sizeof(actual_count)) != 0) {
-                    return -EFAULT;
-                }
+                shm->data_size = actual_count * 296; // sizeof(hwbp_hit_item_t)
             }
             return ret;
         }
         default:
             pr_warn("[kpm_RWBP] Unknown command: %u\n", cmd);
-            kfunc(msleep)(50);
             break;
     }
     return -EINVAL;
 }
+

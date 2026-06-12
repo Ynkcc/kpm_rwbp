@@ -8,6 +8,14 @@
 #include <stdbool.h>
 #endif
 
+#ifdef __USER_SPACE__
+#include <sys/ioctl.h>
+// 用户态通信重定向拦截
+long kpm_ipc_cmd(int fd, unsigned int cmd, void *arg);
+#undef ioctl
+#define ioctl(fd, cmd, arg) kpm_ipc_cmd(fd, cmd, arg)
+#endif
+
 // Ioctl 命令定义，使用简单整数值以避免头文件冲突
 #define OP_READ_MEM                  8001
 #define OP_SET_HW_BREAKPOINT         8011
@@ -59,7 +67,19 @@ typedef struct {
     uint64_t actual_count;    // 输出：实际返回条数
 } hwbp_info_cmd_t;
 
+#define SHM_MAGIC 0x53484d43 // 'SHMC'
+
+typedef struct {
+    uint32_t magic;         // SHM_MAGIC
+    uint32_t cmd;           // OP_READ_MEM 等
+    int32_t  status;        // 0: 空闲/完成, 1: 有请求
+    int32_t  retval;        // 返回码
+    uint32_t data_size;     // 数据载荷大小
+    uint32_t _pad;
+    uint8_t  payload[3500]; // 共享缓冲区 (用于读写数据载荷)
+} shm_channel_t;
+
 // 核心分发入口定义
-long rwbp_dispatch(unsigned int cmd, unsigned long arg);
+long rwbp_dispatch(shm_channel_t *shm);
 
 #endif // __DISPATCHER_H__

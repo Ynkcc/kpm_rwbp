@@ -4,7 +4,7 @@ ANDROID_NDK ?= /home/ynk/Android/Sdk/ndk/27.0.12077973
 
 CC = ${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang
 
-CFLAGS = -Wall -O2 -I../include -I../../src/ipc
+CFLAGS = -Wall -O2 -D__USER_SPACE__ -I../include -I../../src/ipc
 
 OUT_DIR = ../../out
 TARGET  = $(OUT_DIR)/test_rwbp
