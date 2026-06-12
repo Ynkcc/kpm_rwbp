@@ -18,7 +18,6 @@ DEVICE_DIR="/data/local/tmp"
 PUSH_FILES=(
     "kpm_RWBP.kpm"
     "test_rwbp"
-    "target"
 )
 
 # ========== 颜色输出 ==========
