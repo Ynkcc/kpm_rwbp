@@ -9,7 +9,7 @@ CFLAGS = -Wall -O2 -D__USER_SPACE__ -I../include -I../../src/ipc
 OUT_DIR = ../../out
 TARGET  = $(OUT_DIR)/test_rwbp
 
-SRCS = main.c kpm_ctrl.c case_mem_read.c case_hwbp_self.c case_hwbp_target.c
+SRCS = main.c kpm_ctrl.c case_mem_read.c case_hwbp_self.c
 OBJS = $(SRCS:.c=.o)
 
 all: $(TARGET)

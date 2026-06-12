@@ -20,4 +20,13 @@ typedef struct {
  */
 int run_case_hwbp_self(int anon_fd, int scheme, hwbp_scheme_result_t *results, int timeout_ms);
 
+/**
+ * 运行硬件断点目标进程测试
+ *
+ * @param anon_fd    匿名控制 FD
+ * @param scheme     HWBP 方案 (1-4)
+ * @return           检测到断点命中返回 true，否则返回 false
+ */
+bool run_case_hwbp_target(int anon_fd, int scheme);
+
 #endif // CASE_HWBP_SELF_H

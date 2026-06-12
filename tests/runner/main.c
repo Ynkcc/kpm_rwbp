@@ -8,10 +8,8 @@
 #include "kpm_ctrl.h"
 #include "case_mem_read.h"
 #include "case_hwbp_self.h"
-#include "case_hwbp_target.h"
 #include "../include/supercall.h"
 
-#define TARGET_PATH  "/data/local/tmp/target"
 #define DMESG_PATH   "/data/local/tmp/kpm_dmesg.txt"
 #define MAX_RESULTS  16
 
@@ -155,7 +153,7 @@ int main(int argc, char *argv[])
     if (do_target) {
         printf("[*] ========== 运行 case: hwbp_target ==========\n");
         int use_scheme = (scheme == 0) ? 1 : scheme; // target 默认用方案 1
-        bool ok = run_case_hwbp_target(anon_fd, use_scheme, TARGET_PATH);
+        bool ok = run_case_hwbp_target(anon_fd, use_scheme);
         results[result_count++] = (test_result_t){ "hwbp_target", ok };
         printf("\n");
     }
