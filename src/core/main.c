@@ -93,23 +93,32 @@ static void rwbp_fstatfs_hook(hook_fargs2_t *args, void *udata) {
             syscall_set_handled(args, true);
         }
     } else {
+        // [修复] 摒弃在栈上分配 3.5KB 结构体，改用 kmalloc 避免 Kernel Stack Overflow
+        shm_channel_t *local_shm = kfunc(__kmalloc)(sizeof(shm_channel_t), 0x20U); // 0x20U 即 GFP_ATOMIC
+        if (!local_shm) {
+            pr_err("[kpm_RWBP] __kmalloc 分配 IPC 内存失败\n");
+            syscall_set_retval(args, -ENOMEM);
+            syscall_set_handled(args, true);
+            return;
+        }
 
-        // 使用局部栈缓冲区做指令交互
-        shm_channel_t local_shm;
-        long err = compat_copy_from_user(&local_shm, (void __user *)shm_user_vaddr, sizeof(shm_channel_t));
+        long err = compat_copy_from_user(local_shm, (void __user *)shm_user_vaddr, sizeof(shm_channel_t));
         if (err == 0) {
-            if (local_shm.status == 1) {
-                local_shm.status = 2; // 处理中
-                long ret = rwbp_dispatch(&local_shm);
-                local_shm.retval = (int32_t)ret;
-                local_shm.status = 0; // 处理完成
-                // 写回用户态
-                compat_copy_to_user((void __user *)shm_user_vaddr, &local_shm, sizeof(shm_channel_t));
+            if (local_shm->status == 1) {
+                local_shm->status = 2; // 处理中
+                long ret = rwbp_dispatch(local_shm);
+                local_shm->retval = (int32_t)ret;
+                local_shm->status = 0; // 处理完成
+                
+                // [优化] 仅写回被修改的必要长度，避免无关 payload 数据的无意义海量拷贝
+                size_t write_back_sz = offsetof(shm_channel_t, payload) + local_shm->data_size;
+                compat_copy_to_user((void __user *)shm_user_vaddr, local_shm, write_back_sz);
             }
         } else {
             pr_warn("[kpm_RWBP] 读取用户态共享内存失败: err=%ld\n", err);
         }
 
+        kfunc(kfree)(local_shm); // 用完即时释放
         syscall_set_retval(args, 0);
         syscall_set_handled(args, true);
     }

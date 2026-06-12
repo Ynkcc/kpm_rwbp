@@ -18,6 +18,7 @@ uint64_t page_offset_val = 0;
 // 实例化 spinlock.h 中声明的 kfunc 自旋锁指针
 unsigned long (*kf__raw_spin_lock_irqsave)(raw_spinlock_t *lock) = NULL;
 void (*kf__raw_spin_unlock_irqrestore)(raw_spinlock_t *lock, unsigned long flags) = NULL;
+uint64_t (*kf_ktime_get_mono_fast_ns)(void) = NULL;
 
 // 函数指针定义（kfunc_def 展开为 (*kf_xxx)，这里提供存储）
 int kfunc_def(sscanf)(const char *buf, const char *fmt, ...) = NULL;
@@ -126,6 +127,7 @@ long compat_init(void)
 
     kfunc_lookup_name(_raw_spin_lock_irqsave);
     kfunc_lookup_name(_raw_spin_unlock_irqrestore);
+    kfunc_lookup_name(ktime_get_mono_fast_ns);
     kfunc_lookup_name(__task_pid_nr_ns);
 
     // system_wq 在内核中是一个全局指针变量，通过 kallsyms_lookup_name 查找到它的符号地址并进行解引用
@@ -178,6 +180,7 @@ long compat_init(void)
 
 
         !kf__raw_spin_lock_irqsave || !kf__raw_spin_unlock_irqrestore ||
+        !kf_ktime_get_mono_fast_ns ||
         !kf___task_pid_nr_ns) {
         pr_err("[kpm_RWBP] 动态查找核心内核符号失败！\n");
         return -ENOENT;

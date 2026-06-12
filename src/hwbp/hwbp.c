@@ -7,6 +7,14 @@
 #include <linux/string.h>
 #include <linux/list.h>
 #include <linux/err.h>
+#include <linux/spinlock.h>
+
+// 将普通自旋锁重定向为 NMI 安全的兼容层 raw spinlock
+#undef spin_lock_irqsave
+#define spin_lock_irqsave(lock) kf__raw_spin_lock_irqsave(&((lock)->rlock))
+
+#undef spin_unlock_irqrestore
+#define spin_unlock_irqrestore(lock, flags) kf__raw_spin_unlock_irqrestore(&((lock)->rlock), flags)
 
 #define MY_GFP_ATOMIC 0x20U
 
@@ -540,7 +548,7 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
       if (regs) {
           unsigned long rec_flags = spin_lock_irqsave(&found_node->hit_records_lock);
           struct bp_hit_record *rec = &found_node->hit_records[found_node->hit_record_head];
-          rec->hit_time = (uint64_t)kfunc(ktime_get_real_seconds)() * 1000000000LL;
+          rec->hit_time = kf_ktime_get_mono_fast_ns();
           rec->task_id = (uint32_t)kfunc(__task_pid_nr_ns)(current, PIDTYPE_TGID, 0);
           rec->hit_addr = found_node->addr;
           // 保存寄存器快照

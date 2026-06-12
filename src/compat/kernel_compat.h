@@ -9,6 +9,7 @@
     if (!kf_##func) kf_##func = (typeof(kf_##func))kallsyms_lookup_name(#func)
 #include <common.h>
 #include <linux/printk.h>
+#include <linux/spinlock.h>
 
 // 前置结构体声明
 struct task_struct;
@@ -176,6 +177,13 @@ extern uint32_t kp_kernel_version;
 // 兼容层拷贝数据至用户态
 long compat_copy_to_user(void __user *to, const void *from, size_t size);
 long compat_copy_from_user(void *to, const void __user *from, size_t size);
+
+// 声明 raw spinlock 兼容接口指针
+extern unsigned long (*kf__raw_spin_lock_irqsave)(raw_spinlock_t *lock);
+extern void (*kf__raw_spin_unlock_irqrestore)(raw_spinlock_t *lock, unsigned long flags);
+
+// 声明 NMI 安全的高精度单调时间戳获取函数
+extern uint64_t (*kf_ktime_get_mono_fast_ns)(void);
 
 // 兼容层初始化，执行符号查找与动态偏移计算
 long compat_init(void);
