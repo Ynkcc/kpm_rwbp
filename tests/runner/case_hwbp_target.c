@@ -13,6 +13,7 @@
 #include <elf.h>
 #include <time.h>
 #include <fcntl.h>
+#include <errno.h>
 #include "case_hwbp_target.h"
 #include "dispatcher.h"
 
@@ -76,18 +77,102 @@ static int get_process_maps(int pid, driver_region_info_t *maps, int max_maps) {
 // 解析地址对应的模块和偏移量
 static const char* resolve_address(uint64_t pc, driver_region_info_t *maps, int map_count) {
     static char buf[512];
+    uint64_t stripped_pc = pc & 0x0000ffffffffffffULL;
+    bool found = false;
+    
     for (int i = 0; i < map_count; i++) {
-        if (pc >= maps[i].baseaddress && pc < maps[i].baseaddress + maps[i].size) {
+        if (stripped_pc >= maps[i].baseaddress && stripped_pc < maps[i].baseaddress + maps[i].size) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        stripped_pc = pc & 0x0000007fffffffffULL;
+    }
+    
+    for (int i = 0; i < map_count; i++) {
+        if (stripped_pc >= maps[i].baseaddress && stripped_pc < maps[i].baseaddress + maps[i].size) {
+            uint64_t image_base = maps[i].baseaddress;
             if (maps[i].name[0]) {
-                snprintf(buf, sizeof(buf), "%s + 0x%lx", maps[i].name, pc - maps[i].baseaddress);
+                // 寻找同名段的最小映射基地址作为该模块的 Image Base
+                for (int k = 0; k < map_count; k++) {
+                    if (strcmp(maps[k].name, maps[i].name) == 0) {
+                        if (maps[k].baseaddress < image_base) {
+                            image_base = maps[k].baseaddress;
+                        }
+                    }
+                }
+            }
+            uint64_t file_offset = stripped_pc - image_base;
+            if (maps[i].name[0]) {
+                snprintf(buf, sizeof(buf), "%s + 0x%lx", maps[i].name, file_offset);
             } else {
-                snprintf(buf, sizeof(buf), "%lx + 0x%lx", maps[i].baseaddress, pc - maps[i].baseaddress);
+                snprintf(buf, sizeof(buf), "%lx + 0x%lx", maps[i].baseaddress, file_offset);
             }
             return buf;
         }
     }
     snprintf(buf, sizeof(buf), "%lx", pc);
     return buf;
+}
+
+// 自动校验命中记录的合法性 (PC偏移、SP与PC不重合、触发地址正确)
+static bool validate_hit_record(hwbp_hit_item_t *hit, driver_region_info_t *maps, int map_count) {
+    if (hit->hit_addr != 0x2000000000ULL) {
+        printf("  [自动判定失败] 触发地址错误: %p (期望: 0x2000000000)\n", (void*)hit->hit_addr);
+        return false;
+    }
+
+    if (hit->regs_info.pc == hit->regs_info.sp) {
+        printf("  [自动判定失败] 寄存器快照错乱: PC 和 SP 的值相同 (%p)\n", (void*)hit->regs_info.pc);
+        return false;
+    }
+
+    uint64_t stripped_pc = hit->regs_info.pc & 0x0000ffffffffffffULL;
+    uint64_t target_image_base = 0;
+    
+    for (int i = 0; i < map_count; i++) {
+        if (strstr(maps[i].name, "target") != NULL) {
+            if (target_image_base == 0 || maps[i].baseaddress < target_image_base) {
+                target_image_base = maps[i].baseaddress;
+            }
+        }
+    }
+    
+    bool pc_matched = false;
+    for (int i = 0; i < map_count; i++) {
+        if (strstr(maps[i].name, "target") != NULL) {
+            if (stripped_pc >= maps[i].baseaddress && stripped_pc < maps[i].baseaddress + maps[i].size) {
+                pc_matched = true;
+                break;
+            }
+        }
+    }
+    if (!pc_matched) {
+        stripped_pc = hit->regs_info.pc & 0x0000007fffffffffULL;
+        for (int i = 0; i < map_count; i++) {
+            if (strstr(maps[i].name, "target") != NULL) {
+                if (stripped_pc >= maps[i].baseaddress && stripped_pc < maps[i].baseaddress + maps[i].size) {
+                    pc_matched = true;
+                    break;
+                }
+            }
+        }
+    }
+    
+    if (!pc_matched) {
+        printf("  [自动判定失败] 触发的 PC %p 不在 target 进程的内存映射段中\n", (void*)hit->regs_info.pc);
+        return false;
+    }
+
+    uint64_t pc_offset = stripped_pc - target_image_base;
+    if (pc_offset < 0x4b00 || pc_offset > 0x4e00) {
+        printf("  [自动判定失败] 触发的 PC 偏移量 0x%lx 不在 main 解密函数的代码区 (0x4b00 - 0x4e00)\n", pc_offset);
+        return false;
+    }
+
+    printf("  [自动判定成功] 该条命中记录校验通过 (PC偏移: 0x%lx, 地址: 0x2000000000)\n", pc_offset);
+    return true;
 }
 
 // 打印调用栈回溯 (使用 /proc/pid/mem 读取目标进程栈)
@@ -111,8 +196,19 @@ static void print_backtrace(pid_t target_pid, uint64_t fp, uint64_t sp, uint64_t
     
     // Frame 1: LR (返回地址)
     if (lr) {
+        uint64_t stripped_lr = lr & 0x0000ffffffffffffULL;
+        bool lr_found = false;
+        for (int k = 0; k < map_count; k++) {
+            if (stripped_lr >= maps[k].baseaddress && stripped_lr < maps[k].baseaddress + maps[k].size) {
+                lr_found = true;
+                break;
+            }
+        }
+        if (!lr_found) {
+            stripped_lr = lr & 0x0000007fffffffffULL;
+        }
         printf("  #%-2d LR: %p (%s) [来自 FP]\n", 
-               frame_idx++, (void*)lr, resolve_address(lr, maps, map_count));
+               frame_idx++, (void*)stripped_lr, resolve_address(stripped_lr, maps, map_count));
     }
     
     // 循环回溯栈帧
@@ -130,6 +226,18 @@ static void print_backtrace(pid_t target_pid, uint64_t fp, uint64_t sp, uint64_t
         bytes_read = pread(mem_fd, &next_lr, sizeof(next_lr), (off_t)(fp + 8));
         if (bytes_read != sizeof(next_lr)) break;
         
+        uint64_t stripped_next_lr = next_lr & 0x0000ffffffffffffULL;
+        bool lr_found = false;
+        for (int k = 0; k < map_count; k++) {
+            if (stripped_next_lr >= maps[k].baseaddress && stripped_next_lr < maps[k].baseaddress + maps[k].size) {
+                lr_found = true;
+                break;
+            }
+        }
+        if (!lr_found) {
+            stripped_next_lr = next_lr & 0x0000007fffffffffULL;
+        }
+        
         // 安全检查：上一级 FP 必须大于当前 FP（栈往低地址增长）
         if (next_fp <= fp) break;
         
@@ -137,7 +245,7 @@ static void print_backtrace(pid_t target_pid, uint64_t fp, uint64_t sp, uint64_t
         if ((next_fp & 7) != 0) break;
         
         printf("  #%-2d LR: %p (%s) FP: %p\n", 
-               frame_idx++, (void*)next_lr, resolve_address(next_lr, maps, map_count), (void*)next_fp);
+               frame_idx++, (void*)stripped_next_lr, resolve_address(stripped_next_lr, maps, map_count), (void*)next_fp);
         
         fp = next_fp;
     }
@@ -210,6 +318,7 @@ bool run_case_hwbp_target(int anon_fd, int scheme, const char *target_path)
     hwbp_hit_item_t hits[MAX_HIT_RECORDS];
     int poll_count = 0;
     bool has_hits = false;
+    bool test_passed = true;
     
     while (poll_count < 50) {  // 最多轮询 5 秒
         hwbp_info_cmd_t icmd;
@@ -219,6 +328,10 @@ bool run_case_hwbp_target(int anon_fd, int scheme, const char *target_path)
         icmd.user_buf = (uint64_t)hits;
         
         ret = ioctl(anon_fd, OP_READ_HW_BP_INFO, &icmd);
+        if (ret != 0) {
+            printf("[-] [hwbp_target] OP_READ_HW_BP_INFO ioctl 失败, ret=%ld, errno=%d\n", ret, errno);
+            fflush(stdout);
+        }
         if (ret == 0 && icmd.actual_count > 0) {
             has_hits = true;
             printf("\n==========================================================================\n");
@@ -246,6 +359,11 @@ bool run_case_hwbp_target(int anon_fd, int scheme, const char *target_path)
                     hit->regs_info.regs[30],   // LR
                     maps, map_count
                 );
+                
+                // 自动判定命中记录是否合法
+                if (!validate_hit_record(hit, maps, map_count)) {
+                    test_passed = false;
+                }
             }
             printf("==========================================================================\n");
             fflush(stdout);
@@ -263,6 +381,7 @@ bool run_case_hwbp_target(int anon_fd, int scheme, const char *target_path)
     
     if (!has_hits) {
         printf("[-] [hwbp_target] 未检测到任何断点命中!\n");
+        test_passed = false;
     }
 
     kill(target_pid, SIGKILL);
@@ -270,5 +389,5 @@ bool run_case_hwbp_target(int anon_fd, int scheme, const char *target_path)
     printf("[*] [hwbp_target] target 进程已终止\n");
     fflush(stdout);
 
-    return has_hits;
+    return has_hits && test_passed;
 }

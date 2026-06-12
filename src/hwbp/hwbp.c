@@ -64,7 +64,7 @@
 
 // 寄存器快照结构体
 struct bp_regs_snapshot {
-    uint64_t regs[30];  // X0-X29
+    uint64_t regs[31];  // X0-X30
     uint64_t sp;
     uint64_t pc;
     uint64_t pstate;
@@ -529,6 +529,11 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
         return;
     }
 
+    // 去重逻辑：若非方案2且断点已处于临时禁用状态，直接忽略重复触发
+    if (found_node->scheme != 2 && found_node->is_temp_bp) {
+        return;
+    }
+
     found_node->hit_count++;
 
       // 保存命中记录到环形缓冲区
@@ -883,41 +888,18 @@ long read_hwbp_info(uint32_t pid, uint64_t max_count, void __user *user_buf, uin
                 uint32_t idx = (head + MAX_HIT_RECORDS_PER_BP - count + i) % MAX_HIT_RECORDS_PER_BP;
                 struct bp_hit_record *rec = &pos->hit_records[idx];
                 
-                // 转换内核hit记录为用户态结构体
-                struct {
-                    uint64_t hit_time;
-                    uint32_t task_id;
-                    uint32_t _pad;
-                    uint64_t hit_addr;
-                    struct {
-                        uint64_t regs[30];
-                        uint64_t sp;
-                        uint64_t pc;
-                        uint64_t pstate;
-                    } regs_info;
-                } user_hit = {
-                    rec->hit_time,
-                    rec->task_id,
-                    0,
-                    rec->hit_addr,
-                    { { 0 } }
-                };
-                
-                // 复制寄存器
-                for (int j = 0; j < 30; j++) {
-                    user_hit.regs_info.regs[j] = rec->regs_info.regs[j];
-                }
-                user_hit.regs_info.sp = rec->regs_info.sp;
-                user_hit.regs_info.pc = rec->regs_info.pc;
-                user_hit.regs_info.pstate = rec->regs_info.pstate;
-                
-                if (kfunc(copy_to_user_nofault)(user_buf + total_copied * sizeof(user_hit), &user_hit, sizeof(user_hit)) != 0) {
+                if (kfunc(copy_to_user_nofault)(user_buf + total_copied * sizeof(struct bp_hit_record), rec, sizeof(struct bp_hit_record)) != 0) {
                     spin_unlock_irqrestore(&pos->hit_records_lock, rec_flags);
                     spin_unlock_irqrestore(&bp_list_lock, flags);
                     return -EFAULT;
                 }
                 total_copied++;
             }
+            
+            // 消费掉已经读取的记录，重置计数和头部指针
+            pos->hit_record_count = 0;
+            pos->hit_record_head = 0;
+            
             spin_unlock_irqrestore(&pos->hit_records_lock, rec_flags);
             break;  // 只处理第一个匹配的PID
         }

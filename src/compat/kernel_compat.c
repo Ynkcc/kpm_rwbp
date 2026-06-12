@@ -12,6 +12,8 @@ int64_t page_size = 4096;
 int64_t page_shift = 12;
 // 线性区偏移量，由 memstart_addr 与 va_bits 动态计算
 uint64_t linear_voffset = 0;
+uint64_t memstart_addr_val = 0;
+uint64_t page_offset_val = 0;
 
 // 实例化 spinlock.h 中声明的 kfunc 自旋锁指针
 unsigned long (*kf__raw_spin_lock_irqsave)(raw_spinlock_t *lock) = NULL;
@@ -140,15 +142,27 @@ long compat_init(void)
     int64_t *page_shift_ptr = (int64_t *)kallsyms_lookup_name("page_shift");
     if (page_shift_ptr) page_shift = *page_shift_ptr;
 
-    // 动态计算线性区偏移量 linear_voffset
+    // 动态计算线性区偏移量 linear_voffset、page_offset_val 和 memstart_addr_val
     uint64_t *memstart_addr_ptr = (uint64_t *)kallsyms_lookup_name("memstart_addr");
     if (memstart_addr_ptr) {
+        memstart_addr_val = *memstart_addr_ptr;
         uint64_t tcr_el1;
         __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
         uint64_t va_bits_local = 64 - ((tcr_el1 >> 16) & 0x1F);
-        linear_voffset = (-1ULL << va_bits_local) - *memstart_addr_ptr;
-        pr_info("[kpm_RWBP] va_bits=%llu, linear_voffset=%llx\n",
-                (unsigned long long)va_bits_local, (unsigned long long)linear_voffset);
+        
+        // 5.4.0 之前的内核与 5.4.0 之后的内核在 PAGE_OFFSET 的计算底数上相差 1 位 (VA_BITS - 1 vs VA_BITS)
+        if (kp_kernel_version < KERNEL_VERSION_CODE(5, 4, 0)) {
+            page_offset_val = (-1ULL << (va_bits_local - 1));
+        } else {
+            page_offset_val = (-1ULL << va_bits_local);
+        }
+        
+        linear_voffset = page_offset_val - memstart_addr_val;
+        pr_info("[kpm_RWBP] va_bits=%llu, page_offset=%llx, memstart_addr=%llx, linear_voffset=%llx\n",
+                (unsigned long long)va_bits_local,
+                (unsigned long long)page_offset_val,
+                (unsigned long long)memstart_addr_val,
+                (unsigned long long)linear_voffset);
     } else {
         pr_err("[kpm_RWBP] 未找到 memstart_addr，无法计算线性偏移！\n");
         return -ENOENT;

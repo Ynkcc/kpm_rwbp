@@ -11,9 +11,11 @@ extern uint64_t *pgtable_entry(uint64_t pgd, uint64_t va);
 extern int64_t page_size;
 extern int64_t page_shift;
 extern uint64_t linear_voffset;
+extern uint64_t memstart_addr_val;
+extern uint64_t page_offset_val;
 
-// 使用本地 linear_voffset 内联实现，避免依赖 pgtable.h 中未导出的 phys_to_virt
-#define local_phys_to_virt(pa) ((uint64_t)(pa) + linear_voffset)
+// 使用本地 memstart_addr_val 和 page_offset_val 结合按位或，避免依赖 pgtable.h 中未导出的 phys_to_virt，并防止加法进位导致的高位错误偏离
+#define local_phys_to_virt(pa) (((uint64_t)(pa) - memstart_addr_val) | page_offset_val)
 // 页掩码
 #define page_mask (~(page_size - 1))
 

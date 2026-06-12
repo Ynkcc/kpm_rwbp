@@ -165,6 +165,10 @@ extern void kfunc_def(fd_install)(unsigned int fd, struct file *file);
 #define KERNEL_VERSION_PATCH(version) ((version) & 0xFF)
 #endif
 
+// 运行时保存的物理地址偏移与虚拟地址基址
+extern uint64_t memstart_addr_val;
+extern uint64_t page_offset_val;
+
 // 兼容层初始化，执行符号查找与动态偏移计算
 long compat_init(void);
 
