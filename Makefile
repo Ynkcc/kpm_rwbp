@@ -6,15 +6,15 @@ CC = ${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-andr
 LD = ${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/ld.lld
 STRIP = ${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
 
-CFLAGS = -Wall -O2 -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector -fno-unwind-tables -fno-semantic-interposition -fno-common 
-CFLAGS += -Wno-int-conversion
+CFLAGS = -Wall -O2 -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector -fno-unwind-tables -fno-semantic-interposition -fno-common -mno-outline-atomics
+CFLAGS += -Wno-int-conversion -Isrc/core -Isrc/compat -Isrc/memory -Isrc/hwbp -Isrc/ipc
 
 KP_DIR = $(shell pwd)/../KernelPatch
 
 INCLUDE_DIRS := src . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 
-objs := src/main.o src/kernel_compat.o src/mem_reader.o
+objs := src/core/main.o src/compat/kernel_compat.o src/memory/mem_reader.o src/ipc/dispatcher.o src/hwbp/hwbp.o
 out_dir := out
 
 .PHONY: all clean
@@ -30,5 +30,5 @@ $(out_dir)/kpm_RWBP.kpm: ${objs}
 	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -c -O2 -o $@ $<
 
 clean:
-	rm -rf $(out_dir) src/*.o
+	rm -rf $(out_dir) src/core/*.o src/compat/*.o src/memory/*.o src/ipc/*.o src/hwbp/*.o
 	$(MAKE) -C tests clean

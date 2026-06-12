@@ -3,9 +3,9 @@
 .PHONY: all clean
 
 all:
-	$(MAKE) -C client
+	$(MAKE) -C runner
 	$(MAKE) -C target
 
 clean:
-	$(MAKE) -C client clean
+	$(MAKE) -C runner clean
 	$(MAKE) -C target clean

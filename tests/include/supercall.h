@@ -16,8 +16,8 @@
 #define __NR_supercall 45
 
 // 超级调用命令
-#define SUPERCALL_KPM_LOAD 0x1020
-#define SUPERCALL_KPM_UNLOAD 0x1021
+#define SUPERCALL_KPM_LOAD    0x1020
+#define SUPERCALL_KPM_UNLOAD  0x1021
 #define SUPERCALL_KPM_CONTROL 0x1022
 
 // 辅助函数：构造超级调用所需要的控制数据
@@ -44,12 +44,14 @@ static inline long sc_kpm_unload(const char *key, const char *name)
 }
 
 // 发送 KPM 控制消息
-static inline long sc_kpm_control(const char *key, const char *name, const char *ctl_args, char *out_msg, long outlen)
+static inline long sc_kpm_control(const char *key, const char *name, const char *ctl_args,
+                                   char *out_msg, long outlen)
 {
     if (!key || !key[0]) return -EINVAL;
     if (!name || !name[0]) return -EINVAL;
     if (!ctl_args || !ctl_args[0]) return -EINVAL;
-    return syscall(__NR_supercall, key, ver_and_cmd(SUPERCALL_KPM_CONTROL), name, ctl_args, out_msg, outlen);
+    return syscall(__NR_supercall, key, ver_and_cmd(SUPERCALL_KPM_CONTROL),
+                   name, ctl_args, out_msg, outlen);
 }
 
 #endif // __SUPERCALL_H__

@@ -7,16 +7,12 @@ CXXFLAGS = -Wall -O2 -static-libstdc++
 
 OUT_DIR = ../../out
 
-all: $(OUT_DIR)/target $(OUT_DIR)/target_process
+all: $(OUT_DIR)/target
 
 $(OUT_DIR)/target: target.cpp
 	mkdir -p $(OUT_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
-$(OUT_DIR)/target_process: target_process.cpp
-	mkdir -p $(OUT_DIR)
-	$(CXX) $(CXXFLAGS) -o $@ $<
-
 .PHONY: clean
 clean:
-	rm -f $(OUT_DIR)/target $(OUT_DIR)/target_process
+	rm -f $(OUT_DIR)/target

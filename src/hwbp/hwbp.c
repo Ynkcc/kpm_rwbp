@@ -1,0 +1,779 @@
+#include "hwbp.h"
+#include "kernel_compat.h"
+#include <syscall.h>
+#include <linux/errno.h>
+#include <linux/printk.h>
+#include <linux/sched.h>
+#include <linux/string.h>
+#include <linux/list.h>
+#include <linux/err.h>
+
+#define MY_GFP_ATOMIC 0x20U
+
+// 默认启用方案 B（连续触发/步过模式），如果注释掉则使用方案 A（单次触发模式）
+// #define CONFIG_MODIFY_HIT_NEXT_MODE 1
+
+#ifndef PSR_MODE32_BIT
+#define PSR_MODE32_BIT 0x00000010
+#endif
+#ifndef PSR_AA32_T_BIT
+#define PSR_AA32_T_BIT 0x00000020
+#endif
+
+// ARM64 调试寄存器相关定义
+#define AARCH64_DBG_REG_BVR   0
+#define AARCH64_DBG_REG_BCR  16
+#define AARCH64_DBG_REG_WVR  32
+#define AARCH64_DBG_REG_WCR  48
+
+// ARM64 调试寄存器访问宏
+#define AARCH64_DBG_READ_WVR(N, VAL) \
+    asm volatile("mrs %0, dbgwvr" #N "_el1" : "=r"(VAL))
+
+#define AARCH64_DBG_WRITE_WVR(N, VAL) \
+    asm volatile("msr dbgwvr" #N "_el1, %0" :: "r"(VAL))
+
+#define AARCH64_DBG_READ_WCR(N, VAL) \
+    asm volatile("mrs %0, dbgwcr" #N "_el1" : "=r"(VAL))
+
+#define AARCH64_DBG_WRITE_WCR(N, VAL) \
+    asm volatile("msr dbgwcr" #N "_el1, %0" :: "r"(VAL))
+
+#define AARCH64_DBG_READ_BVR(N, VAL) \
+    asm volatile("mrs %0, dbgbvr" #N "_el1" : "=r"(VAL))
+
+#define AARCH64_DBG_WRITE_BVR(N, VAL) \
+    asm volatile("msr dbgbvr" #N "_el1, %0" :: "r"(VAL))
+
+#define AARCH64_DBG_READ_BCR(N, VAL) \
+    asm volatile("mrs %0, dbgbcr" #N "_el1" : "=r"(VAL))
+
+#define AARCH64_DBG_WRITE_BCR(N, VAL) \
+    asm volatile("msr dbgbcr" #N "_el1, %0" :: "r"(VAL))
+
+#ifndef ID_AA64DFR0_EL1
+#define ID_AA64DFR0_EL1 0
+#endif
+
+#ifndef read_cpuid
+#define read_cpuid(reg) 0
+#endif
+
+struct bp_hit_info {
+    uint64_t addr;
+    uint32_t pid;
+    uint32_t hit_count;
+};
+
+struct bp_node {
+    struct list_head list;
+    struct perf_event *bp;
+    uint32_t pid;
+    uint64_t addr;
+    uint32_t type;
+    uint32_t len;
+    uint64_t hit_count;
+    struct work_struct unreg_work;
+    struct perf_event_attr orig_attr;
+    bool is_temp_bp;
+    struct work_struct recovery_work;
+    uint32_t scheme;
+    struct perf_event_attr next_instruction_attr;
+};
+
+struct register_work {
+    struct work_struct work;
+    uint32_t pid;
+    uint64_t addr;
+    uint32_t type;
+    uint32_t len;
+    uint32_t scheme;
+};
+
+static LIST_HEAD(bp_list);
+static DEFINE_SPINLOCK(bp_list_lock);
+volatile int in_flight = 0;
+static void (*kf_on_each_cpu)(void (*func)(void *info), void *info, int wait) = NULL;
+
+static void my_init_work(struct work_struct *work, work_func_t func) {
+    work->data = 0;
+    work->entry.next = (struct my_list_head *)&work->entry;
+    work->entry.prev = (struct my_list_head *)&work->entry;
+    work->func = func;
+}
+
+static int get_cpu_num_wrps(void) {
+    return ((read_cpuid(ID_AA64DFR0_EL1) >> 20) & 0xf) + 1;
+}
+
+static uint64_t read_wb_reg(int reg_idx, int n) {
+    uint64_t val = 0;
+    if (reg_idx == AARCH64_DBG_REG_WVR) {
+        switch(n) {
+            case 0: AARCH64_DBG_READ_WVR(0, val); break;
+            case 1: AARCH64_DBG_READ_WVR(1, val); break;
+            case 2: AARCH64_DBG_READ_WVR(2, val); break;
+            case 3: AARCH64_DBG_READ_WVR(3, val); break;
+            case 4: AARCH64_DBG_READ_WVR(4, val); break;
+            case 5: AARCH64_DBG_READ_WVR(5, val); break;
+            case 6: AARCH64_DBG_READ_WVR(6, val); break;
+            case 7: AARCH64_DBG_READ_WVR(7, val); break;
+            case 8: AARCH64_DBG_READ_WVR(8, val); break;
+            case 9: AARCH64_DBG_READ_WVR(9, val); break;
+            case 10: AARCH64_DBG_READ_WVR(10, val); break;
+            case 11: AARCH64_DBG_READ_WVR(11, val); break;
+            case 12: AARCH64_DBG_READ_WVR(12, val); break;
+            case 13: AARCH64_DBG_READ_WVR(13, val); break;
+            case 14: AARCH64_DBG_READ_WVR(14, val); break;
+            case 15: AARCH64_DBG_READ_WVR(15, val); break;
+        }
+    } else if (reg_idx == AARCH64_DBG_REG_WCR) {
+        switch(n) {
+            case 0: AARCH64_DBG_READ_WCR(0, val); break;
+            case 1: AARCH64_DBG_READ_WCR(1, val); break;
+            case 2: AARCH64_DBG_READ_WCR(2, val); break;
+            case 3: AARCH64_DBG_READ_WCR(3, val); break;
+            case 4: AARCH64_DBG_READ_WCR(4, val); break;
+            case 5: AARCH64_DBG_READ_WCR(5, val); break;
+            case 6: AARCH64_DBG_READ_WCR(6, val); break;
+            case 7: AARCH64_DBG_READ_WCR(7, val); break;
+            case 8: AARCH64_DBG_READ_WCR(8, val); break;
+            case 9: AARCH64_DBG_READ_WCR(9, val); break;
+            case 10: AARCH64_DBG_READ_WCR(10, val); break;
+            case 11: AARCH64_DBG_READ_WCR(11, val); break;
+            case 12: AARCH64_DBG_READ_WCR(12, val); break;
+            case 13: AARCH64_DBG_READ_WCR(13, val); break;
+            case 14: AARCH64_DBG_READ_WCR(14, val); break;
+            case 15: AARCH64_DBG_READ_WCR(15, val); break;
+        }
+    } else if (reg_idx == AARCH64_DBG_REG_BVR) {
+        switch(n) {
+            case 0: AARCH64_DBG_READ_BVR(0, val); break;
+            case 1: AARCH64_DBG_READ_BVR(1, val); break;
+            case 2: AARCH64_DBG_READ_BVR(2, val); break;
+            case 3: AARCH64_DBG_READ_BVR(3, val); break;
+            case 4: AARCH64_DBG_READ_BVR(4, val); break;
+            case 5: AARCH64_DBG_READ_BVR(5, val); break;
+            case 6: AARCH64_DBG_READ_BVR(6, val); break;
+            case 7: AARCH64_DBG_READ_BVR(7, val); break;
+            case 8: AARCH64_DBG_READ_BVR(8, val); break;
+            case 9: AARCH64_DBG_READ_BVR(9, val); break;
+            case 10: AARCH64_DBG_READ_BVR(10, val); break;
+            case 11: AARCH64_DBG_READ_BVR(11, val); break;
+            case 12: AARCH64_DBG_READ_BVR(12, val); break;
+            case 13: AARCH64_DBG_READ_BVR(13, val); break;
+            case 14: AARCH64_DBG_READ_BVR(14, val); break;
+            case 15: AARCH64_DBG_READ_BVR(15, val); break;
+        }
+    } else if (reg_idx == AARCH64_DBG_REG_BCR) {
+        switch(n) {
+            case 0: AARCH64_DBG_READ_BCR(0, val); break;
+            case 1: AARCH64_DBG_READ_BCR(1, val); break;
+            case 2: AARCH64_DBG_READ_BCR(2, val); break;
+            case 3: AARCH64_DBG_READ_BCR(3, val); break;
+            case 4: AARCH64_DBG_READ_BCR(4, val); break;
+            case 5: AARCH64_DBG_READ_BCR(5, val); break;
+            case 6: AARCH64_DBG_READ_BCR(6, val); break;
+            case 7: AARCH64_DBG_READ_BCR(7, val); break;
+            case 8: AARCH64_DBG_READ_BCR(8, val); break;
+            case 9: AARCH64_DBG_READ_BCR(9, val); break;
+            case 10: AARCH64_DBG_READ_BCR(10, val); break;
+            case 11: AARCH64_DBG_READ_BCR(11, val); break;
+            case 12: AARCH64_DBG_READ_BCR(12, val); break;
+            case 13: AARCH64_DBG_READ_BCR(13, val); break;
+            case 14: AARCH64_DBG_READ_BCR(14, val); break;
+            case 15: AARCH64_DBG_READ_BCR(15, val); break;
+        }
+    } else {
+        pr_warn("[kpm_RWBP] read_wb_reg: unknown register idx %d, n=%d\n", reg_idx, n);
+    }
+    return val;
+}
+
+static void write_wb_reg(int reg_idx, int n, uint64_t val) {
+    if (reg_idx == AARCH64_DBG_REG_WVR) {
+        switch(n) {
+            case 0: AARCH64_DBG_WRITE_WVR(0, val); break;
+            case 1: AARCH64_DBG_WRITE_WVR(1, val); break;
+            case 2: AARCH64_DBG_WRITE_WVR(2, val); break;
+            case 3: AARCH64_DBG_WRITE_WVR(3, val); break;
+            case 4: AARCH64_DBG_WRITE_WVR(4, val); break;
+            case 5: AARCH64_DBG_WRITE_WVR(5, val); break;
+            case 6: AARCH64_DBG_WRITE_WVR(6, val); break;
+            case 7: AARCH64_DBG_WRITE_WVR(7, val); break;
+            case 8: AARCH64_DBG_WRITE_WVR(8, val); break;
+            case 9: AARCH64_DBG_WRITE_WVR(9, val); break;
+            case 10: AARCH64_DBG_WRITE_WVR(10, val); break;
+            case 11: AARCH64_DBG_WRITE_WVR(11, val); break;
+            case 12: AARCH64_DBG_WRITE_WVR(12, val); break;
+            case 13: AARCH64_DBG_WRITE_WVR(13, val); break;
+            case 14: AARCH64_DBG_WRITE_WVR(14, val); break;
+            case 15: AARCH64_DBG_WRITE_WVR(15, val); break;
+        }
+    } else if (reg_idx == AARCH64_DBG_REG_WCR) {
+        switch(n) {
+            case 0: AARCH64_DBG_WRITE_WCR(0, val); break;
+            case 1: AARCH64_DBG_WRITE_WCR(1, val); break;
+            case 2: AARCH64_DBG_WRITE_WCR(2, val); break;
+            case 3: AARCH64_DBG_WRITE_WCR(3, val); break;
+            case 4: AARCH64_DBG_WRITE_WCR(4, val); break;
+            case 5: AARCH64_DBG_WRITE_WCR(5, val); break;
+            case 6: AARCH64_DBG_WRITE_WCR(6, val); break;
+            case 7: AARCH64_DBG_WRITE_WCR(7, val); break;
+            case 8: AARCH64_DBG_WRITE_WCR(8, val); break;
+            case 9: AARCH64_DBG_WRITE_WCR(9, val); break;
+            case 10: AARCH64_DBG_WRITE_WCR(10, val); break;
+            case 11: AARCH64_DBG_WRITE_WCR(11, val); break;
+            case 12: AARCH64_DBG_WRITE_WCR(12, val); break;
+            case 13: AARCH64_DBG_WRITE_WCR(13, val); break;
+            case 14: AARCH64_DBG_WRITE_WCR(14, val); break;
+            case 15: AARCH64_DBG_WRITE_WCR(15, val); break;
+        }
+    } else if (reg_idx == AARCH64_DBG_REG_BVR) {
+        switch(n) {
+            case 0: AARCH64_DBG_WRITE_BVR(0, val); break;
+            case 1: AARCH64_DBG_WRITE_BVR(1, val); break;
+            case 2: AARCH64_DBG_WRITE_BVR(2, val); break;
+            case 3: AARCH64_DBG_WRITE_BVR(3, val); break;
+            case 4: AARCH64_DBG_WRITE_BVR(4, val); break;
+            case 5: AARCH64_DBG_WRITE_BVR(5, val); break;
+            case 6: AARCH64_DBG_WRITE_BVR(6, val); break;
+            case 7: AARCH64_DBG_WRITE_BVR(7, val); break;
+            case 8: AARCH64_DBG_WRITE_BVR(8, val); break;
+            case 9: AARCH64_DBG_WRITE_BVR(9, val); break;
+            case 10: AARCH64_DBG_WRITE_BVR(10, val); break;
+            case 11: AARCH64_DBG_WRITE_BVR(11, val); break;
+            case 12: AARCH64_DBG_WRITE_BVR(12, val); break;
+            case 13: AARCH64_DBG_WRITE_BVR(13, val); break;
+            case 14: AARCH64_DBG_WRITE_BVR(14, val); break;
+            case 15: AARCH64_DBG_WRITE_BVR(15, val); break;
+        }
+    } else if (reg_idx == AARCH64_DBG_REG_BCR) {
+        switch(n) {
+            case 0: AARCH64_DBG_WRITE_BCR(0, val); break;
+            case 1: AARCH64_DBG_WRITE_BCR(1, val); break;
+            case 2: AARCH64_DBG_WRITE_BCR(2, val); break;
+            case 3: AARCH64_DBG_WRITE_BCR(3, val); break;
+            case 4: AARCH64_DBG_WRITE_BCR(4, val); break;
+            case 5: AARCH64_DBG_WRITE_BCR(5, val); break;
+            case 6: AARCH64_DBG_WRITE_BCR(6, val); break;
+            case 7: AARCH64_DBG_WRITE_BCR(7, val); break;
+            case 8: AARCH64_DBG_WRITE_BCR(8, val); break;
+            case 9: AARCH64_DBG_WRITE_BCR(9, val); break;
+            case 10: AARCH64_DBG_WRITE_BCR(10, val); break;
+            case 11: AARCH64_DBG_WRITE_BCR(11, val); break;
+            case 12: AARCH64_DBG_WRITE_BCR(12, val); break;
+            case 13: AARCH64_DBG_WRITE_BCR(13, val); break;
+            case 14: AARCH64_DBG_WRITE_BCR(14, val); break;
+            case 15: AARCH64_DBG_WRITE_BCR(15, val); break;
+        }
+    } else {
+        pr_warn("[kpm_RWBP] write_wb_reg: unknown register idx %d, n=%d\n", reg_idx, n);
+    }
+    __asm__ volatile("isb" ::: "memory");
+}
+
+static uint64_t calc_hw_addr(uint64_t bp_addr, uint32_t bp_type, uint32_t bp_len) {
+    uint64_t alignment_mask;
+    if (bp_type == 4) {
+        alignment_mask = 0x3;
+    } else {
+        if (bp_len == 8)
+            alignment_mask = 0x7;
+        else if (bp_len == 4)
+            alignment_mask = 0x3;
+        else
+            alignment_mask = 0x7;
+    }
+    return bp_addr & ~alignment_mask;
+}
+
+static bool toggle_bp_registers_directly(uint64_t bp_addr, uint32_t bp_type, uint32_t bp_len, int enable) {
+    int i, max_slots;
+    uint64_t hw_addr = calc_hw_addr(bp_addr, bp_type, bp_len);
+    uint32_t ctrl;
+    int val_reg, ctrl_reg;
+    
+    pr_info("[kpm_RWBP] toggle_bp_registers_directly: addr=0x%llx, type=%u, len=%u, enable=%d\n",
+            (unsigned long long)hw_addr, bp_type, bp_len, enable);
+    
+    if (bp_type == 4) { // HW_BREAKPOINT_X (execute)
+        ctrl_reg = AARCH64_DBG_REG_BCR;
+        val_reg = AARCH64_DBG_REG_BVR;
+        max_slots = 6;
+    } else {
+        ctrl_reg = AARCH64_DBG_REG_WCR;
+        val_reg = AARCH64_DBG_REG_WVR;
+        max_slots = get_cpu_num_wrps();
+    }
+    
+    for (i = 0; i < max_slots; i++) {
+        uint64_t addr = read_wb_reg(val_reg, i);
+        if (addr == hw_addr) {
+            ctrl = read_wb_reg(ctrl_reg, i);
+            if (enable)
+                ctrl |= 0x1;
+            else
+                ctrl &= ~0x1;
+            write_wb_reg(ctrl_reg, i, ctrl);
+            pr_info("[kpm_RWBP] toggle_bp_registers_directly: found slot %d, new ctrl=0x%x\n", i, ctrl);
+            return true;
+        }
+    }
+    
+    pr_warn("[kpm_RWBP] toggle_bp_registers_directly: no matching slot found for addr 0x%llx\n",
+            (unsigned long long)hw_addr);
+    return false;
+}
+
+static void recovery_bp_work_func(struct work_struct *work) {
+    struct bp_node *node = container_of(work, struct bp_node, recovery_work);
+    pr_info("[kpm_RWBP] 工作队列: 正在异步重新启用硬件断点 %px\n", node->bp);
+    kfunc(perf_event_enable)(node->bp);
+    node->is_temp_bp = false;
+}
+
+static bool arm64_move_bp_to_next_instruction(struct perf_event *bp, uint64_t next_instruction_addr, struct perf_event_attr *original_attr, struct perf_event_attr *next_instruction_attr) {
+    int result;
+    if (!bp || !original_attr || !next_instruction_attr || !next_instruction_addr) {
+        return false;
+    }
+    memcpy(next_instruction_attr, original_attr, sizeof(struct perf_event_attr));
+    next_instruction_attr->bp_addr = next_instruction_addr;
+    next_instruction_attr->bp_len = 4; // HW_BREAKPOINT_LEN_4
+    next_instruction_attr->bp_type = 4; // HW_BREAKPOINT_X
+    next_instruction_attr->disabled = 0;
+    result = kfunc(modify_user_hw_breakpoint)(bp, next_instruction_attr);
+    if (result) {
+        next_instruction_attr->bp_addr = 0;
+        return false;
+    }
+    return true;
+}
+
+static bool arm64_recovery_bp_to_original(struct perf_event *bp, struct perf_event_attr *original_attr, struct perf_event_attr *next_instruction_attr) {
+    int result;
+    if (!bp || !original_attr || !next_instruction_attr) {
+        return false;
+    }
+    result = kfunc(modify_user_hw_breakpoint)(bp, original_attr);
+    if (result) {
+        return false;
+    }
+    next_instruction_attr->bp_addr = 0;
+    return true;
+}
+
+#include <hook.h>
+void before_watchpoint_handler(hook_fargs3_t *args, void *udata) {
+    unsigned long addr = (unsigned long)args->arg0;
+    struct pt_regs *regs = (struct pt_regs *)args->arg2;
+    unsigned long flags;
+    struct bp_node *pos;
+    bool found = false;
+
+    flags = spin_lock_irqsave(&bp_list_lock);
+    list_for_each_entry(pos, &bp_list, list) {
+        if (pos->scheme == 3 && pos->pid == __task_pid_nr_ns(current, PIDTYPE_TGID, 0)) {
+            uint64_t hw_addr = calc_hw_addr(pos->addr, pos->type, pos->len);
+            if ((addr & ~7ULL) == hw_addr) {
+                pos->hit_count++;
+                found = true;
+                break;
+            }
+        }
+    }
+    spin_unlock_irqrestore(&bp_list_lock, flags);
+
+    if (found) {
+        pr_info("[kpm_RWBP] Scheme 3 Hooked watchpoint triggered! addr=0x%lx, PC=0x%llx\n", addr, regs ? regs->pc : 0);
+        uint64_t ctrl = read_wb_reg(AARCH64_DBG_REG_WCR, 0);
+        write_wb_reg(AARCH64_DBG_REG_WCR, 0, ctrl & ~1ULL);
+    }
+}
+
+static bool hook_installed = false;
+static hook_err_t wp_hook_err = 0;
+
+static void install_wp_hook(void) {
+    if (hook_installed) return;
+    void *wp_handler_addr = (void *)kallsyms_lookup_name("watchpoint_handler");
+    if (wp_handler_addr) {
+        wp_hook_err = hook_wrap3(wp_handler_addr, before_watchpoint_handler, NULL, NULL);
+        if (wp_hook_err == 0) {
+            hook_installed = true;
+            pr_info("[kpm_RWBP] watchpoint_handler hooked successfully!\n");
+        } else {
+            pr_err("[kpm_RWBP] Failed to hook watchpoint_handler, err=%d\n", wp_hook_err);
+        }
+    } else {
+        pr_err("[kpm_RWBP] watchpoint_handler symbol not found!\n");
+    }
+}
+
+void remove_wp_hook(void) {
+    if (hook_installed) {
+        void *wp_handler_addr = (void *)kallsyms_lookup_name("watchpoint_handler");
+        if (wp_handler_addr) {
+            hook_unwrap(wp_handler_addr, before_watchpoint_handler, NULL);
+        }
+        hook_installed = false;
+    }
+}
+
+static void disable_wp_regs_on_cpu(void *info) {
+    write_wb_reg(AARCH64_DBG_REG_WCR, 0, 0);
+    write_wb_reg(AARCH64_DBG_REG_WVR, 0, 0);
+}
+
+static void unregister_bp_work_func(struct work_struct *work) {
+    struct bp_node *node = container_of(work, struct bp_node, unreg_work);
+    if (node->scheme == 3) {
+        if (!kf_on_each_cpu) {
+            kf_on_each_cpu = (void *)kallsyms_lookup_name("on_each_cpu");
+        }
+        if (kf_on_each_cpu) {
+            kf_on_each_cpu(disable_wp_regs_on_cpu, NULL, 1);
+        }
+        pr_info("[kpm_RWBP] Scheme 3: 硬件断点全CPU广播注销成功\n");
+    } else if (node->bp) {
+        pr_info("[kpm_RWBP] 工作队列: 正在异步移除硬件断点 %px\n", node->bp);
+        kfunc(unregister_hw_breakpoint)(node->bp);
+    }
+    kfunc(kfree)(node);
+    __sync_fetch_and_sub(&in_flight, 1);
+}
+
+static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
+    unsigned long flags;
+    struct bp_node *pos, *found_node = NULL;
+    
+    flags = spin_lock_irqsave(&bp_list_lock);
+    list_for_each_entry(pos, &bp_list, list) {
+        if (pos->bp == bp) {
+            found_node = pos;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&bp_list_lock, flags);
+    
+    if (!found_node) {
+        return;
+    }
+
+    found_node->hit_count++;
+
+    if (found_node->scheme == 1) {
+        pr_info("[kpm_RWBP] Scheme 1 triggered! PC=0x%llx\n", regs ? regs->pc : 0);
+        toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 0);
+        kfunc(perf_event_disable_inatomic)(bp);
+        found_node->is_temp_bp = true;
+        kfunc(queue_work_on)(0, (struct workqueue_struct *)kf_system_wq, &found_node->recovery_work);
+    } 
+    else if (found_node->scheme == 2) {
+        if (!found_node->is_temp_bp) {
+            // First hit (watchpoint)
+            pr_info("[kpm_RWBP] Scheme 2 triggered (First Hit)! PC=0x%llx\n", regs ? regs->pc : 0);
+            if (regs && arm64_move_bp_to_next_instruction(bp, regs->pc, &found_node->orig_attr, &found_node->next_instruction_attr)) {
+                found_node->is_temp_bp = true;
+            } else {
+                pr_err("[kpm_RWBP] Scheme 2: Failed to move bp to next instruction!\n");
+                toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 0);
+                kfunc(perf_event_disable_inatomic)(bp);
+            }
+        } else {
+            // Second hit (execution breakpoint step-over)
+            pr_info("[kpm_RWBP] Scheme 2 triggered (Second Hit)! PC=0x%llx\n", regs ? regs->pc : 0);
+            if (arm64_recovery_bp_to_original(bp, &found_node->orig_attr, &found_node->next_instruction_attr)) {
+                found_node->is_temp_bp = false;
+            } else {
+                pr_err("[kpm_RWBP] Scheme 2: Failed to restore original bp!\n");
+                toggle_bp_registers_directly(found_node->next_instruction_attr.bp_addr, 4, 4, 0);
+                kfunc(perf_event_disable_inatomic)(bp);
+            }
+        }
+    }
+    else if (found_node->scheme == 4) {
+        pr_info("[kpm_RWBP] Scheme 4 triggered! PC=0x%llx\n", regs ? regs->pc : 0);
+        struct perf_event_attr disabled_attr = found_node->orig_attr;
+        disabled_attr.disabled = 1;
+        kfunc(modify_user_hw_breakpoint)(bp, &disabled_attr);
+    }
+    else {
+        toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 0);
+        kfunc(perf_event_disable_inatomic)(bp);
+    }
+}
+
+static void write_wp_regs_on_cpu(void *info) {
+    struct bp_node *node = (struct bp_node *)info;
+    uint64_t hw_addr = calc_hw_addr(node->addr, node->type, node->len);
+    write_wb_reg(AARCH64_DBG_REG_WVR, 0, hw_addr);
+    uint32_t ctrl = 1 | (3 << 1) | (3 << 3) | (0xff << 5);
+    write_wb_reg(AARCH64_DBG_REG_WCR, 0, ctrl);
+
+    // Enable MDSCR_EL1.MDE
+    uint64_t mdscr;
+    asm volatile("mrs %0, mdscr_el1" : "=r"(mdscr));
+    mdscr |= (1ULL << 15);
+    asm volatile("msr mdscr_el1, %0" :: "r"(mdscr));
+    asm volatile("isb" ::: "memory");
+}
+
+static void register_bp_work_func(struct work_struct *work) {
+    struct register_work *reg_work = container_of(work, struct register_work, work);
+    unsigned long flags;
+    
+    pr_info("[kpm_RWBP] register_bp_work_func: PID=%u, addr=0x%llx, type=%u, len=%u, scheme=%u\n",
+            reg_work->pid, (unsigned long long)reg_work->addr, reg_work->type, reg_work->len, reg_work->scheme);
+    
+    if (reg_work->scheme == 3) {
+        install_wp_hook();
+        struct bp_node *node = kfunc(__kmalloc)(sizeof(struct bp_node), MY_GFP_ATOMIC);
+        if (node) {
+            node->bp = NULL;
+            node->pid = reg_work->pid;
+            node->addr = reg_work->addr;
+            node->type = reg_work->type;
+            node->len = reg_work->len;
+            node->scheme = 3;
+            node->hit_count = 0;
+            node->is_temp_bp = false;
+            
+            flags = spin_lock_irqsave(&bp_list_lock);
+            list_add(&node->list, &bp_list);
+            spin_unlock_irqrestore(&bp_list_lock, flags);
+            
+            if (!kf_on_each_cpu) {
+                kf_on_each_cpu = (void *)kallsyms_lookup_name("on_each_cpu");
+            }
+            if (kf_on_each_cpu) {
+                kf_on_each_cpu(write_wp_regs_on_cpu, node, 1);
+            }
+            pr_info("[kpm_RWBP] Scheme 3: 硬件断点全CPU广播使能成功\n");
+        }
+    } else {
+        void *task = kfunc(find_task_by_vpid)(reg_work->pid);
+        if (!task) {
+            pr_err("[kpm_RWBP] 异步注册工作线程: 未找到 PID %u 对应的进程\n", reg_work->pid);
+            kfunc(kfree)(reg_work);
+            __sync_fetch_and_sub(&in_flight, 1);
+            return;
+        }
+
+        struct perf_event_attr attr;
+        kfunc(memset)(&attr, 0, sizeof(attr));
+        attr.type = 5;
+        attr.size = sizeof(struct perf_event_attr);
+        if (kver >> 9 >= 0x285) {
+            attr.size = 120;
+            if (kver > 0x50EFF) {
+                attr.size = (kver >> 8 > 0x600) ? 136 : 128;
+            }
+        }
+        attr.exclude_kernel = 1;
+        attr.exclude_hv = 1;
+        attr.exclude_user = 0;
+        attr.disabled = 0;
+        attr.pinned = 1;
+        attr.sigtrap = 0;
+        attr.sample_period = 1;
+        attr.bp_type = reg_work->type;
+        attr.bp_addr = reg_work->addr;
+        attr.bp_len = reg_work->len;
+
+        struct perf_event *bp = kfunc(register_user_hw_breakpoint)(&attr, hwbp_triggered, NULL, task);
+        if (IS_ERR(bp)) {
+            long err = PTR_ERR(bp);
+            pr_err("[kpm_RWBP] 注册失败，错误码: %ld\n", err);
+        } else {
+            struct bp_node *node = kfunc(__kmalloc)(sizeof(struct bp_node), MY_GFP_ATOMIC);
+            if (node) {
+                node->bp = bp;
+                node->pid = reg_work->pid;
+                node->addr = reg_work->addr;
+                node->type = reg_work->type;
+                node->len = reg_work->len;
+                node->scheme = reg_work->scheme;
+                node->hit_count = 0;
+                node->orig_attr = attr;
+                node->is_temp_bp = false;
+                my_init_work(&node->recovery_work, recovery_bp_work_func);
+                
+                flags = spin_lock_irqsave(&bp_list_lock);
+                list_add(&node->list, &bp_list);
+                spin_unlock_irqrestore(&bp_list_lock, flags);
+                
+                kfunc(perf_event_enable)(bp);
+                pr_info("[kpm_RWBP] 硬件断点注册成功，内核指针: %px, 方案: %u\n", bp, reg_work->scheme);
+            } else {
+                kfunc(unregister_hw_breakpoint)(bp);
+            }
+        }
+    }
+
+    kfunc(kfree)(reg_work);
+    __sync_fetch_and_sub(&in_flight, 1);
+}
+
+long register_hwbp(uint32_t pid, uint64_t addr, uint32_t type, uint32_t len, uint32_t scheme) {
+    unsigned long flags;
+    struct bp_node *pos;
+    
+    pr_info("[kpm_RWBP] register_hwbp: PID=%u, addr=0x%llx, type=%u, len=%u, scheme=%u\n",
+            pid, (unsigned long long)addr, type, len, scheme);
+    
+    flags = spin_lock_irqsave(&bp_list_lock);
+    list_for_each_entry(pos, &bp_list, list) {
+        if (pos->pid == pid && pos->addr == addr) {
+            spin_unlock_irqrestore(&bp_list_lock, flags);
+            return -EEXIST;
+        }
+    }
+    spin_unlock_irqrestore(&bp_list_lock, flags);
+
+    if (scheme == 3) {
+        install_wp_hook();
+        struct bp_node *node = kfunc(__kmalloc)(sizeof(struct bp_node), MY_GFP_ATOMIC);
+        if (node) {
+            node->bp = NULL;
+            node->pid = pid;
+            node->addr = addr;
+            node->type = type;
+            node->len = len;
+            node->scheme = 3;
+            node->hit_count = 0;
+            node->is_temp_bp = false;
+            
+            flags = spin_lock_irqsave(&bp_list_lock);
+            list_add(&node->list, &bp_list);
+            spin_unlock_irqrestore(&bp_list_lock, flags);
+            
+            if (!kf_on_each_cpu) {
+                kf_on_each_cpu = (void *)kallsyms_lookup_name("on_each_cpu");
+            }
+            if (kf_on_each_cpu) {
+                kf_on_each_cpu(write_wp_regs_on_cpu, node, 1);
+            }
+            pr_info("[kpm_RWBP] register_hwbp Scheme 3: 硬件断点全CPU广播使能成功\n");
+        } else {
+            return -ENOMEM;
+        }
+        return 0;
+    }
+
+    void *task = kfunc(find_task_by_vpid)(pid);
+    if (!task) {
+        pr_err("[kpm_RWBP] register_hwbp: 未找到 PID %u 对应的进程\n", pid);
+        return -ESRCH;
+    }
+
+    struct perf_event_attr attr;
+    kfunc(memset)(&attr, 0, sizeof(attr));
+    attr.type = 5;
+    attr.size = sizeof(struct perf_event_attr);
+    if (kver >> 9 >= 0x285) {
+        attr.size = 120;
+        if (kver > 0x50EFF) {
+            attr.size = (kver >> 8 > 0x600) ? 136 : 128;
+        }
+    }
+    attr.exclude_kernel = 1;
+    attr.exclude_hv = 1;
+    attr.exclude_user = 0;
+    attr.disabled = 0;
+    attr.pinned = 1;
+    attr.sigtrap = 0;
+    attr.sample_period = 1;
+    attr.bp_type = type;
+    attr.bp_addr = addr;
+    attr.bp_len = len;
+
+    struct perf_event *bp = kfunc(register_user_hw_breakpoint)(&attr, hwbp_triggered, NULL, task);
+    if (IS_ERR(bp)) {
+        long err = PTR_ERR(bp);
+        pr_err("[kpm_RWBP] register_hwbp: 注册失败，错误码: %ld\n", err);
+        return err;
+    }
+    
+    struct bp_node *node = kfunc(__kmalloc)(sizeof(struct bp_node), MY_GFP_ATOMIC);
+    if (node) {
+        node->bp = bp;
+        node->pid = pid;
+        node->addr = addr;
+        node->type = type;
+        node->len = len;
+        node->scheme = scheme;
+        node->hit_count = 0;
+        node->orig_attr = attr;
+        node->is_temp_bp = false;
+        my_init_work(&node->recovery_work, recovery_bp_work_func);
+        
+        flags = spin_lock_irqsave(&bp_list_lock);
+        list_add(&node->list, &bp_list);
+        spin_unlock_irqrestore(&bp_list_lock, flags);
+        
+        kfunc(perf_event_enable)(bp);
+        pr_info("[kpm_RWBP] register_hwbp: 硬件断点注册成功，内核指针: %px, 方案: %u\n", bp, scheme);
+    } else {
+        kfunc(unregister_hw_breakpoint)(bp);
+        return -ENOMEM;
+    }
+    
+    return 0;
+}
+
+long unregister_hwbp(uint32_t pid, uint64_t addr) {
+    unsigned long flags;
+    struct bp_node *pos, *n;
+    struct bp_node *target_node = NULL;
+
+    flags = spin_lock_irqsave(&bp_list_lock);
+    list_for_each_entry_safe(pos, n, &bp_list, list) {
+        if (pos->pid == pid && pos->addr == addr) {
+            list_del(&pos->list);
+            target_node = pos;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&bp_list_lock, flags);
+
+    if (!target_node) {
+        return -ENOENT;
+    }
+
+    __sync_fetch_and_add(&in_flight, 1);
+    my_init_work(&target_node->unreg_work, unregister_bp_work_func);
+    kfunc(queue_work_on)(0, (struct workqueue_struct *)kf_system_wq, &target_node->unreg_work);
+    return 0;
+}
+
+long unregister_all_hwbp(void) {
+    unsigned long flags;
+    struct bp_node *pos, *n;
+
+    flags = spin_lock_irqsave(&bp_list_lock);
+    list_for_each_entry_safe(pos, n, &bp_list, list) {
+        list_del(&pos->list);
+        __sync_fetch_and_add(&in_flight, 1);
+        my_init_work(&pos->unreg_work, unregister_bp_work_func);
+        kfunc(queue_work_on)(0, (struct workqueue_struct *)kf_system_wq, &pos->unreg_work);
+    }
+    spin_unlock_irqrestore(&bp_list_lock, flags);
+    return 0;
+}
+
+long query_hwbp_hit(uint32_t pid, uint64_t addr) {
+    unsigned long flags;
+    struct bp_node *pos;
+    
+    flags = spin_lock_irqsave(&bp_list_lock);
+    list_for_each_entry(pos, &bp_list, list) {
+        if (pos->pid == pid && pos->addr == addr) {
+            spin_unlock_irqrestore(&bp_list_lock, flags);
+            return pos->hit_count;
+        }
+    }
+    spin_unlock_irqrestore(&bp_list_lock, flags);
+    return -ENOENT;
+}
