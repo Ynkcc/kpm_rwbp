@@ -65,6 +65,27 @@ long rwbp_dispatch(unsigned int cmd, unsigned long arg)
             kfunc(msleep)(50);
             return unregister_all_hwbp();
         }
+        case OP_READ_HW_BP_INFO: {
+            pr_info("[kpm_RWBP] rwbp_dispatch: OP_READ_HW_BP_INFO\n");
+            kfunc(msleep)(50);
+
+            hwbp_info_cmd_t icmd;
+            if (kfunc(copy_from_user_nofault)(&icmd, (void __user *)arg, sizeof(icmd)) != 0) {
+                return -EFAULT;
+            }
+
+            uint64_t actual_count = 0;
+            long ret = read_hwbp_info(icmd.pid, icmd.max_count,
+                                      (void __user *)icmd.user_buf, &actual_count);
+            if (ret == 0) {
+                // 将实际数量拷贝回用户空间
+                if (kfunc(copy_to_user_nofault)((void __user *)(arg + offsetof(hwbp_info_cmd_t, actual_count)),
+                                        &actual_count, sizeof(actual_count)) != 0) {
+                    return -EFAULT;
+                }
+            }
+            return ret;
+        }
         default:
             pr_warn("[kpm_RWBP] Unknown command: %u\n", cmd);
             kfunc(msleep)(50);

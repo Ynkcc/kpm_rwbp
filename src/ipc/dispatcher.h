@@ -5,6 +5,7 @@
 #include <common.h>
 #else
 #include <stdint.h>
+#include <stdbool.h>
 #endif
 
 // Ioctl 命令定义，使用简单整数值以避免头文件冲突
@@ -12,6 +13,7 @@
 #define OP_SET_HW_BREAKPOINT         8011
 #define OP_REMOVE_HW_BREAKPOINT      8013
 #define OP_REMOVE_ALL_HW_BREAKPOINT  8014
+#define OP_READ_HW_BP_INFO           8015  // 新增：读取断点命中信息
 
 // 内存读取命令参数结构体
 typedef struct {
@@ -30,6 +32,32 @@ typedef struct {
     uint32_t len;
     uint32_t scheme; // 1: 方案1, 2: 方案2, 3: 方案3, 4: 方案4
 } hw_breakpoint_cmd_t;
+
+// 寄存器快照结构体 (ARM64)
+typedef struct {
+    uint64_t regs[31];  // X0-X30 (LR)
+    uint64_t sp;       // 栈指针
+    uint64_t pc;       // 程序计数器
+    uint64_t pstate;   // 处理器状态
+} hwbp_regs_snapshot_t;
+
+// 单条命中记录结构体
+typedef struct {
+    uint64_t hit_time;         // 命中时间戳
+    uint32_t task_id;         // 触发线程 ID
+    uint32_t _pad;
+    uint64_t hit_addr;        // 触发地址
+    hwbp_regs_snapshot_t regs_info;  // 寄存器快照
+} hwbp_hit_item_t;
+
+// 命中信息读取结构体
+typedef struct {
+    uint32_t pid;             // 目标进程 PID
+    uint32_t _pad;
+    uint64_t max_count;       // 输入：最大返回条数
+    uint64_t user_buf;        // 输出：hwbp_hit_item_t 数组指针
+    uint64_t actual_count;    // 输出：实际返回条数
+} hwbp_info_cmd_t;
 
 // 核心分发入口定义
 long rwbp_dispatch(unsigned int cmd, unsigned long arg);

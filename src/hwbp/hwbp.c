@@ -59,6 +59,26 @@
 #define read_cpuid(reg) 0
 #endif
 
+// 最大保存的命中记录数
+#define MAX_HIT_RECORDS_PER_BP 64
+
+// 寄存器快照结构体
+struct bp_regs_snapshot {
+    uint64_t regs[30];  // X0-X29
+    uint64_t sp;
+    uint64_t pc;
+    uint64_t pstate;
+};
+
+// 单条命中记录
+struct bp_hit_record {
+    uint64_t hit_time;
+    uint32_t task_id;
+    uint32_t _pad;
+    uint64_t hit_addr;
+    struct bp_regs_snapshot regs_info;
+};
+
 struct bp_hit_info {
     uint64_t addr;
     uint32_t pid;
@@ -79,6 +99,11 @@ struct bp_node {
     struct work_struct recovery_work;
     uint32_t scheme;
     struct perf_event_attr next_instruction_attr;
+    // 命中记录环形缓冲区
+    struct bp_hit_record hit_records[MAX_HIT_RECORDS_PER_BP];
+    uint32_t hit_record_head;
+    uint32_t hit_record_count;
+    spinlock_t hit_records_lock;
 };
 
 struct register_work {
@@ -506,7 +531,32 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
 
     found_node->hit_count++;
 
-    pr_info("[kpm_RWBP] === Hardware Breakpoint Hit ===\n");
+      // 保存命中记录到环形缓冲区
+      if (regs) {
+          unsigned long rec_flags = spin_lock_irqsave(&found_node->hit_records_lock);
+          struct bp_hit_record *rec = &found_node->hit_records[found_node->hit_record_head];
+          rec->hit_time = (uint64_t)kfunc(ktime_get_real_seconds)() * 1000000000LL;
+          rec->task_id = (uint32_t)kfunc(__task_pid_nr_ns)(current, PIDTYPE_TGID, 0);
+          rec->hit_addr = found_node->addr;
+          // 保存寄存器快照
+          rec->regs_info.pc = regs->pc;
+          rec->regs_info.sp = regs->sp;
+          rec->regs_info.pstate = regs->pstate;
+          // regs->regs[0..30] are saved differently depending on arch
+          // For ARM64 pt_regs, regs[0] is at offset 0, regs[1] at 8, etc.
+          // On ARM64: struct pt_regs has regs[0]..regs[30] at offset 0..240
+          uint64_t *reg_ptr = (uint64_t *)regs;
+          for (int i = 0; i < 31; i++) {
+              rec->regs_info.regs[i] = reg_ptr[i];
+          }
+          found_node->hit_record_head = (found_node->hit_record_head + 1) % MAX_HIT_RECORDS_PER_BP;
+          if (found_node->hit_record_count < MAX_HIT_RECORDS_PER_BP) {
+              found_node->hit_record_count++;
+          }
+          spin_unlock_irqrestore(&found_node->hit_records_lock, rec_flags);
+      }
+
+      pr_info("[kpm_RWBP] === Hardware Breakpoint Hit ===\n");
     pr_info("[kpm_RWBP] PID: %u, Addr: 0x%llx, Hit Count: %llu\n",
             found_node->pid, found_node->addr, found_node->hit_count);
     pr_info("[kpm_RWBP] PC: 0x%llx\n", regs ? regs->pc : 0);
@@ -579,17 +629,20 @@ static void register_bp_work_func(struct work_struct *work) {
             reg_work->pid, (unsigned long long)reg_work->addr, reg_work->type, reg_work->len, reg_work->scheme);
     
     if (reg_work->scheme == 3) {
-        install_wp_hook();
-        struct bp_node *node = kfunc(__kmalloc)(sizeof(struct bp_node), MY_GFP_ATOMIC);
-        if (node) {
-            node->bp = NULL;
-            node->pid = reg_work->pid;
-            node->addr = reg_work->addr;
-            node->type = reg_work->type;
-            node->len = reg_work->len;
-            node->scheme = 3;
-            node->hit_count = 0;
-            node->is_temp_bp = false;
+          install_wp_hook();
+          struct bp_node *node = kfunc(__kmalloc)(sizeof(struct bp_node), MY_GFP_ATOMIC);
+          if (node) {
+              node->bp = NULL;
+              node->pid = reg_work->pid;
+              node->addr = reg_work->addr;
+              node->type = reg_work->type;
+              node->len = reg_work->len;
+              node->scheme = 3;
+              node->hit_count = 0;
+              node->is_temp_bp = false;
+              node->hit_record_head = 0;
+              node->hit_record_count = 0;
+              spin_lock_init(&node->hit_records_lock);
             
             flags = spin_lock_irqsave(&bp_list_lock);
             list_add(&node->list, &bp_list);
@@ -625,16 +678,19 @@ static void register_bp_work_func(struct work_struct *work) {
         } else {
             struct bp_node *node = kfunc(__kmalloc)(sizeof(struct bp_node), MY_GFP_ATOMIC);
             if (node) {
-                node->bp = bp;
-                node->pid = reg_work->pid;
-                node->addr = reg_work->addr;
-                node->type = reg_work->type;
-                node->len = reg_work->len;
-                node->scheme = reg_work->scheme;
-                node->hit_count = 0;
-                node->orig_attr = attr;
-                node->is_temp_bp = false;
-                my_init_work(&node->recovery_work, recovery_bp_work_func);
+                  node->bp = bp;
+                  node->pid = reg_work->pid;
+                  node->addr = reg_work->addr;
+                  node->type = reg_work->type;
+                  node->len = reg_work->len;
+                  node->scheme = reg_work->scheme;
+                  node->hit_count = 0;
+                  node->orig_attr = attr;
+                  node->is_temp_bp = false;
+                  node->hit_record_head = 0;
+                  node->hit_record_count = 0;
+                  spin_lock_init(&node->hit_records_lock);
+                  my_init_work(&node->recovery_work, recovery_bp_work_func);
                 
                 flags = spin_lock_irqsave(&bp_list_lock);
                 list_add(&node->list, &bp_list);
@@ -669,17 +725,20 @@ long register_hwbp(uint32_t pid, uint64_t addr, uint32_t type, uint32_t len, uin
     spin_unlock_irqrestore(&bp_list_lock, flags);
 
     if (scheme == 3) {
-        install_wp_hook();
-        struct bp_node *node = kfunc(__kmalloc)(sizeof(struct bp_node), MY_GFP_ATOMIC);
-        if (node) {
-            node->bp = NULL;
-            node->pid = pid;
-            node->addr = addr;
-            node->type = type;
-            node->len = len;
-            node->scheme = 3;
-            node->hit_count = 0;
-            node->is_temp_bp = false;
+          install_wp_hook();
+          struct bp_node *node = kfunc(__kmalloc)(sizeof(struct bp_node), MY_GFP_ATOMIC);
+          if (node) {
+              node->bp = NULL;
+              node->pid = pid;
+              node->addr = addr;
+              node->type = type;
+              node->len = len;
+              node->scheme = 3;
+              node->hit_count = 0;
+              node->is_temp_bp = false;
+              node->hit_record_head = 0;
+              node->hit_record_count = 0;
+              spin_lock_init(&node->hit_records_lock);
             
             flags = spin_lock_irqsave(&bp_list_lock);
             list_add(&node->list, &bp_list);
@@ -718,17 +777,20 @@ long register_hwbp(uint32_t pid, uint64_t addr, uint32_t type, uint32_t len, uin
     }
     
     struct bp_node *node = kfunc(__kmalloc)(sizeof(struct bp_node), MY_GFP_ATOMIC);
-    if (node) {
-        node->bp = bp;
-        node->pid = pid;
-        node->addr = addr;
-        node->type = type;
-        node->len = len;
-        node->scheme = scheme;
-        node->hit_count = 0;
-        node->orig_attr = attr;
-        node->is_temp_bp = false;
-        my_init_work(&node->recovery_work, recovery_bp_work_func);
+      if (node) {
+          node->bp = bp;
+          node->pid = pid;
+          node->addr = addr;
+          node->type = type;
+          node->len = len;
+          node->scheme = scheme;
+          node->hit_count = 0;
+          node->orig_attr = attr;
+          node->is_temp_bp = false;
+          node->hit_record_head = 0;
+          node->hit_record_count = 0;
+          spin_lock_init(&node->hit_records_lock);
+          my_init_work(&node->recovery_work, recovery_bp_work_func);
         
         flags = spin_lock_irqsave(&bp_list_lock);
         list_add(&node->list, &bp_list);
@@ -797,4 +859,71 @@ long query_hwbp_hit(uint32_t pid, uint64_t addr) {
     }
     spin_unlock_irqrestore(&bp_list_lock, flags);
     return -ENOENT;
+}
+
+long read_hwbp_info(uint32_t pid, uint64_t max_count, void __user *user_buf, uint64_t *actual_count) {
+    unsigned long flags;
+    struct bp_node *pos;
+    uint64_t total_copied = 0;
+
+    if (max_count == 0 || user_buf == NULL) {
+        return -EINVAL;
+    }
+
+    flags = spin_lock_irqsave(&bp_list_lock);
+    list_for_each_entry(pos, &bp_list, list) {
+        if (pos->pid == pid) {
+            // 遍历该 PID 的所有断点节点
+            unsigned long rec_flags = spin_lock_irqsave(&pos->hit_records_lock);
+            
+            uint32_t count = pos->hit_record_count;
+            uint32_t head = pos->hit_record_head;
+            
+            for (uint32_t i = 0; i < count && total_copied < max_count; i++) {
+                uint32_t idx = (head + MAX_HIT_RECORDS_PER_BP - count + i) % MAX_HIT_RECORDS_PER_BP;
+                struct bp_hit_record *rec = &pos->hit_records[idx];
+                
+                // 转换内核hit记录为用户态结构体
+                struct {
+                    uint64_t hit_time;
+                    uint32_t task_id;
+                    uint32_t _pad;
+                    uint64_t hit_addr;
+                    struct {
+                        uint64_t regs[30];
+                        uint64_t sp;
+                        uint64_t pc;
+                        uint64_t pstate;
+                    } regs_info;
+                } user_hit = {
+                    rec->hit_time,
+                    rec->task_id,
+                    0,
+                    rec->hit_addr,
+                    { { 0 } }
+                };
+                
+                // 复制寄存器
+                for (int j = 0; j < 30; j++) {
+                    user_hit.regs_info.regs[j] = rec->regs_info.regs[j];
+                }
+                user_hit.regs_info.sp = rec->regs_info.sp;
+                user_hit.regs_info.pc = rec->regs_info.pc;
+                user_hit.regs_info.pstate = rec->regs_info.pstate;
+                
+                if (kfunc(copy_to_user_nofault)(user_buf + total_copied * sizeof(user_hit), &user_hit, sizeof(user_hit)) != 0) {
+                    spin_unlock_irqrestore(&pos->hit_records_lock, rec_flags);
+                    spin_unlock_irqrestore(&bp_list_lock, flags);
+                    return -EFAULT;
+                }
+                total_copied++;
+            }
+            spin_unlock_irqrestore(&pos->hit_records_lock, rec_flags);
+            break;  // 只处理第一个匹配的PID
+        }
+    }
+    spin_unlock_irqrestore(&bp_list_lock, flags);
+
+    *actual_count = total_copied;
+    return 0;
 }

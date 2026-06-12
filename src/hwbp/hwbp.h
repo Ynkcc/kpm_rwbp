@@ -18,4 +18,7 @@ long unregister_all_hwbp(void);
 // 移除 watchpoint_handler inline hook 接口
 void remove_wp_hook(void);
 
+// 读取断点命中信息
+long read_hwbp_info(uint32_t pid, uint64_t max_count, void __user *user_buf, uint64_t *actual_count);
+
 #endif // __HWBP_H__
