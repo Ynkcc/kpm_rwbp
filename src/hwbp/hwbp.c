@@ -102,6 +102,39 @@ static void my_init_work(struct work_struct *work, work_func_t func) {
     work->func = func;
 }
 
+// PERF_TYPE_BREAKPOINT is 5 in Linux kernel
+#ifndef PERF_TYPE_BREAKPOINT
+#define PERF_TYPE_BREAKPOINT 5
+#endif
+
+// 初始化 perf_event_attr 用于硬件断点
+static void init_perf_event_attr_bp(struct perf_event_attr *attr, uint32_t type) {
+    memset(attr, 0, sizeof(struct perf_event_attr));
+    attr->type = PERF_TYPE_BREAKPOINT;
+    // 根据内核版本设置正确的 size（从内核源码确认）
+    // 4.19.x: size = 112, 6.6.x: size = 136
+    if (KERNEL_VERSION_MAJOR(kver) >= 6) {
+        attr->size = 136;
+    } else {
+        attr->size = 112;
+    }
+    attr->bp_type = type;  // 0=execution, 1=write, 2=read, 3=access
+    attr->sample_period = 1;  // 每个命中都触发回调
+}
+
+// 设置断点排除选项
+static void set_perf_event_exclude(struct perf_event_attr *attr, int exclude_user, int exclude_kernel, int exclude_hv) {
+    attr->exclude_user = exclude_user;
+    attr->exclude_kernel = exclude_kernel;
+    attr->exclude_hv = exclude_hv;
+}
+
+// 设置断点地址和长度
+static void set_perf_event_bp_addr(struct perf_event_attr *attr, uint64_t addr, uint64_t len) {
+    attr->bp_addr = addr;
+    attr->bp_len = len;
+}
+
 static int get_cpu_num_wrps(void) {
     return ((read_cpuid(ID_AA64DFR0_EL1) >> 20) & 0xf) + 1;
 }
@@ -328,9 +361,16 @@ static bool toggle_bp_registers_directly(uint64_t bp_addr, uint32_t bp_type, uin
 
 static void recovery_bp_work_func(struct work_struct *work) {
     struct bp_node *node = container_of(work, struct bp_node, recovery_work);
-    pr_info("[kpm_RWBP] 工作队列: 正在异步重新启用硬件断点 %px\n", node->bp);
-    kfunc(perf_event_enable)(node->bp);
-    node->is_temp_bp = false;
+    if (node->scheme == 4) {
+        struct perf_event_attr disabled_attr = node->orig_attr;
+        disabled_attr.disabled = 1;
+        pr_info("[kpm_RWBP] 工作队列: 正在调用 modify_user_hw_breakpoint 禁用硬件断点 %px\n", node->bp);
+        kfunc(modify_user_hw_breakpoint)(node->bp, &disabled_attr);
+    } else {
+        pr_info("[kpm_RWBP] 工作队列: 正在异步重新启用硬件断点 %px\n", node->bp);
+        kfunc(perf_event_enable)(node->bp);
+        node->is_temp_bp = false;
+    }
 }
 
 static bool arm64_move_bp_to_next_instruction(struct perf_event *bp, uint64_t next_instruction_addr, struct perf_event_attr *original_attr, struct perf_event_attr *next_instruction_attr) {
@@ -448,6 +488,8 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
     unsigned long flags;
     struct bp_node *pos, *found_node = NULL;
     
+    pr_info("[kpm_RWBP] hwbp_triggered called! bp=%px\n", bp);
+    
     flags = spin_lock_irqsave(&bp_list_lock);
     list_for_each_entry(pos, &bp_list, list) {
         if (pos->bp == bp) {
@@ -458,10 +500,18 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
     spin_unlock_irqrestore(&bp_list_lock, flags);
     
     if (!found_node) {
+        pr_warn("[kpm_RWBP] hwbp_triggered: node not found for bp=%px\n", bp);
         return;
     }
 
     found_node->hit_count++;
+
+    pr_info("[kpm_RWBP] === Hardware Breakpoint Hit ===\n");
+    pr_info("[kpm_RWBP] PID: %u, Addr: 0x%llx, Hit Count: %llu\n",
+            found_node->pid, found_node->addr, found_node->hit_count);
+    pr_info("[kpm_RWBP] PC: 0x%llx\n", regs ? regs->pc : 0);
+    pr_info("[kpm_RWBP] Stack trace:\n");
+    kfunc(dump_stack)();
 
     if (found_node->scheme == 1) {
         pr_info("[kpm_RWBP] Scheme 1 triggered! PC=0x%llx\n", regs ? regs->pc : 0);
@@ -474,11 +524,11 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
         if (!found_node->is_temp_bp) {
             // First hit (watchpoint)
             pr_info("[kpm_RWBP] Scheme 2 triggered (First Hit)! PC=0x%llx\n", regs ? regs->pc : 0);
-            if (regs && arm64_move_bp_to_next_instruction(bp, regs->pc, &found_node->orig_attr, &found_node->next_instruction_attr)) {
+            toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 0);
+            if (regs && arm64_move_bp_to_next_instruction(bp, regs->pc + 4, &found_node->orig_attr, &found_node->next_instruction_attr)) {
                 found_node->is_temp_bp = true;
             } else {
                 pr_err("[kpm_RWBP] Scheme 2: Failed to move bp to next instruction!\n");
-                toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 0);
                 kfunc(perf_event_disable_inatomic)(bp);
             }
         } else {
@@ -486,6 +536,7 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
             pr_info("[kpm_RWBP] Scheme 2 triggered (Second Hit)! PC=0x%llx\n", regs ? regs->pc : 0);
             if (arm64_recovery_bp_to_original(bp, &found_node->orig_attr, &found_node->next_instruction_attr)) {
                 found_node->is_temp_bp = false;
+                toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 1);
             } else {
                 pr_err("[kpm_RWBP] Scheme 2: Failed to restore original bp!\n");
                 toggle_bp_registers_directly(found_node->next_instruction_attr.bp_addr, 4, 4, 0);
@@ -495,9 +546,9 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
     }
     else if (found_node->scheme == 4) {
         pr_info("[kpm_RWBP] Scheme 4 triggered! PC=0x%llx\n", regs ? regs->pc : 0);
-        struct perf_event_attr disabled_attr = found_node->orig_attr;
-        disabled_attr.disabled = 1;
-        kfunc(modify_user_hw_breakpoint)(bp, &disabled_attr);
+        toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 0);
+        kfunc(perf_event_disable_inatomic)(bp);
+        kfunc(queue_work_on)(0, (struct workqueue_struct *)kf_system_wq, &found_node->recovery_work);
     }
     else {
         toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 0);
@@ -562,25 +613,10 @@ static void register_bp_work_func(struct work_struct *work) {
         }
 
         struct perf_event_attr attr;
-        kfunc(memset)(&attr, 0, sizeof(attr));
-        attr.type = 5;
-        attr.size = sizeof(struct perf_event_attr);
-        if (kver >> 9 >= 0x285) {
-            attr.size = 120;
-            if (kver > 0x50EFF) {
-                attr.size = (kver >> 8 > 0x600) ? 136 : 128;
-            }
-        }
-        attr.exclude_kernel = 1;
-        attr.exclude_hv = 1;
-        attr.exclude_user = 0;
-        attr.disabled = 0;
-        attr.pinned = 1;
-        attr.sigtrap = 0;
-        attr.sample_period = 1;
-        attr.bp_type = reg_work->type;
-        attr.bp_addr = reg_work->addr;
-        attr.bp_len = reg_work->len;
+        init_perf_event_attr_bp(&attr, reg_work->type);
+        attr.disabled = 0;  // 启用断点
+        set_perf_event_exclude(&attr, 0, 1, 1);  // exclude_kernel=1, exclude_hv=1
+        set_perf_event_bp_addr(&attr, reg_work->addr, reg_work->len);
 
         struct perf_event *bp = kfunc(register_user_hw_breakpoint)(&attr, hwbp_triggered, NULL, task);
         if (IS_ERR(bp)) {
@@ -669,25 +705,10 @@ long register_hwbp(uint32_t pid, uint64_t addr, uint32_t type, uint32_t len, uin
     }
 
     struct perf_event_attr attr;
-    kfunc(memset)(&attr, 0, sizeof(attr));
-    attr.type = 5;
-    attr.size = sizeof(struct perf_event_attr);
-    if (kver >> 9 >= 0x285) {
-        attr.size = 120;
-        if (kver > 0x50EFF) {
-            attr.size = (kver >> 8 > 0x600) ? 136 : 128;
-        }
-    }
-    attr.exclude_kernel = 1;
-    attr.exclude_hv = 1;
-    attr.exclude_user = 0;
-    attr.disabled = 0;
-    attr.pinned = 1;
-    attr.sigtrap = 0;
-    attr.sample_period = 1;
-    attr.bp_type = type;
-    attr.bp_addr = addr;
-    attr.bp_len = len;
+    init_perf_event_attr_bp(&attr, type);
+    attr.disabled = 0;  // 启用断点
+    set_perf_event_exclude(&attr, 0, 1, 1);  // exclude_kernel=1, exclude_hv=1
+    set_perf_event_bp_addr(&attr, addr, len);
 
     struct perf_event *bp = kfunc(register_user_hw_breakpoint)(&attr, hwbp_triggered, NULL, task);
     if (IS_ERR(bp)) {

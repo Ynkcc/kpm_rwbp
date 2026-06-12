@@ -4,6 +4,9 @@
 #include <linux/spinlock.h>
 #include <linux/sched.h>
 
+// 运行时内核版本（由 compat_init 设置）
+uint32_t kp_kernel_version = 0;
+
 // 本地页大小变量（pgtable.h 中声明的 extern，此处提供实体定义）
 int64_t page_size = 4096;
 int64_t page_shift = 12;
@@ -20,9 +23,11 @@ struct task_struct *kfunc_def(find_task_by_vpid)(pid_t nr) = NULL;
 pid_t (*kf___task_pid_nr_ns)(struct task_struct *task, enum pid_type type, struct pid_namespace *ns) = NULL;
 uint64_t kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, uint64_t n) = NULL;
 int kfunc_def(sprint_symbol)(char *buffer, unsigned long address) = NULL;
+void kfunc_def(dump_stack)(void) = NULL;
 int kfunc_def(access_process_vm)(void *tsk, unsigned long addr, void *buf, int len, unsigned int gup_flags) = NULL;
 long kfunc_def(copy_from_user_nofault)(void *dst, const void __user *src, size_t size) = NULL;
-long kfunc_def(copy_to_user_nofault)(void __user *to, const void *from, size_t size) = NULL;
+long kfunc_def(copy_to_user_nofault)(void *dst, const void *from, size_t size) = NULL;
+void *kfunc_def(memset)(void *s, int c, size_t n) = NULL;
 
 struct perf_event *kfunc_def(register_user_hw_breakpoint)(struct perf_event_attr *attr,
                                                          perf_overflow_handler_t triggered,
@@ -51,13 +56,51 @@ int kfunc_def(get_unused_fd_flags)(unsigned int flags) = NULL;
 void kfunc_def(put_unused_fd)(unsigned int fd) = NULL;
 void kfunc_def(fd_install)(unsigned int fd, struct file *file) = NULL;
 
+// 从 UTS_RELEASE 字符串解析内核版本
+static uint32_t parse_kernel_version(const char *release) {
+    int major = 0, minor = 0, patch = 0;
+    const char *p = release;
+    
+    // 解析主版本号
+    while (*p && *p >= '0' && *p <= '9') {
+        major = major * 10 + (*p - '0');
+        p++;
+    }
+    if (*p == '.') p++;
+    
+    // 解析次版本号
+    while (*p && *p >= '0' && *p <= '9') {
+        minor = minor * 10 + (*p - '0');
+        p++;
+    }
+    if (*p == '.') p++;
+    
+    // 解析补丁版本号（可能带有其他后缀如 -rc1, -generic 等）
+    while (*p && *p >= '0' && *p <= '9') {
+        patch = patch * 10 + (*p - '0');
+        p++;
+    }
+    
+    return KERNEL_VERSION_CODE(major, minor, patch);
+}
+
 long compat_init(void)
 {
+    // 直接使用 KernelPatch 框架提供的 kver 变量
+    kp_kernel_version = kver;
+    pr_info("[kpm_RWBP] 检测到内核版本: %d.%d.%d (0x%08x)\n",
+            KERNEL_VERSION_MAJOR(kp_kernel_version),
+            KERNEL_VERSION_MINOR(kp_kernel_version),
+            KERNEL_VERSION_PATCH(kp_kernel_version),
+            kp_kernel_version);
+    
     // 动态查找所有核心函数 and 变量
     kfunc_lookup_name(sscanf);
     kfunc_lookup_name(find_task_by_vpid);
     kfunc_lookup_name(__arch_copy_to_user);
     kfunc_lookup_name(sprint_symbol);
+    kfunc_lookup_name(dump_stack);
+    kfunc_lookup_name(memset);
     kfunc_lookup_name(access_process_vm);
     kfunc_lookup_name(copy_from_user_nofault);
     kfunc_lookup_name(copy_to_user_nofault);
@@ -111,6 +154,7 @@ long compat_init(void)
         return -ENOENT;
     }
 
+    // 验证必需的内核符号
     if (!kfunc(sscanf) || !kfunc(find_task_by_vpid) || !kfunc(__arch_copy_to_user) || 
         !kfunc(sprint_symbol) || !kfunc(copy_from_user_nofault) || !kfunc(copy_to_user_nofault) ||
         !kfunc(register_user_hw_breakpoint) || !kfunc(unregister_hw_breakpoint) || !kfunc(modify_user_hw_breakpoint) ||
@@ -125,8 +169,11 @@ long compat_init(void)
         pr_err("[kpm_RWBP] 动态查找核心内核符号失败！\n");
         return -ENOENT;
     }
-
-    pr_info("[kpm_RWBP] 内核兼容适配动态初始化完成\n");
+    
+    pr_info("[kpm_RWBP] 内核兼容适配动态初始化完成 (版本: %d.%d.%d)\n",
+            KERNEL_VERSION_MAJOR(kp_kernel_version),
+            KERNEL_VERSION_MINOR(kp_kernel_version),
+            KERNEL_VERSION_PATCH(kp_kernel_version));
 
     return 0;
 }

@@ -150,6 +150,21 @@ extern int kfunc_def(get_unused_fd_flags)(unsigned int flags);
 extern void kfunc_def(put_unused_fd)(unsigned int fd);
 extern void kfunc_def(fd_install)(unsigned int fd, struct file *file);
 
+// KernelPatch 版本宏（与标准 Linux kernel_version 编码兼容）
+// VERSION(major, minor, patch) = (major << 16) + (minor << 8) + patch
+#ifndef KERNEL_VERSION_CODE
+#define KERNEL_VERSION_CODE(major, minor, patch) (((major) << 16) + ((minor) << 8) + (patch))
+#endif
+#ifndef KERNEL_VERSION_MAJOR
+#define KERNEL_VERSION_MAJOR(version) (((version) >> 16) & 0xFF)
+#endif
+#ifndef KERNEL_VERSION_MINOR
+#define KERNEL_VERSION_MINOR(version) (((version) >> 8) & 0xFF)
+#endif
+#ifndef KERNEL_VERSION_PATCH
+#define KERNEL_VERSION_PATCH(version) ((version) & 0xFF)
+#endif
+
 // 兼容层初始化，执行符号查找与动态偏移计算
 long compat_init(void);
 
