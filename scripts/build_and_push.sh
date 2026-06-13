@@ -17,6 +17,7 @@ DEVICE_DIR="/data/local/tmp"
 # 需要推送到设备的产物列表
 PUSH_FILES=(
     "kpm_RWBP.kpm"
+    "kpm_alt_pstore.kpm"
     "test_rwbp"
 )
 
@@ -39,6 +40,11 @@ do_build() {
     # 编译内核模块 + tests（根 Makefile 的 all 目标已包含 tests）
     make -C "${PROJECT_ROOT}" all
 
+    # 编译 kpm_alt_pstore 模块并拷贝至 out 目录
+    info "编译 kpm_alt_pstore..."
+    make -C "${PROJECT_ROOT}/../kpm_alt_pstore" all
+    cp "${PROJECT_ROOT}/../kpm_alt_pstore/out/kpm_alt_pstore.kpm" "${OUT_DIR}/"
+
     echo ""
     ok "编译完成，产物列表:"
     ls -lh "${OUT_DIR}"/ 2>/dev/null || warn "out 目录为空"
@@ -48,6 +54,7 @@ do_build() {
 do_clean() {
     info "清理构建产物..."
     make -C "${PROJECT_ROOT}" clean
+    make -C "${PROJECT_ROOT}/../kpm_alt_pstore" clean
     ok "清理完成"
 }
 

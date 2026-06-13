@@ -99,6 +99,18 @@ int main(int argc, char *argv[])
     } while (0)
 
     // --- 预卸载、加载 KPM ---
+    printf("[*] 卸载旧 kpm_alt_pstore 模块 (如有)...\n");
+    sc_kpm_unload(KPM_KEY, "kpm_alt_pstore");
+    usleep(200000);
+
+    printf("[*] 加载 kpm_alt_pstore KPM: /data/local/tmp/kpm_alt_pstore.kpm\n");
+    if (kpm_load(KPM_KEY, "/data/local/tmp/kpm_alt_pstore.kpm") != 0) {
+        printf("[-] 加载 kpm_alt_pstore 失败，但尝试继续...\n");
+    } else {
+        printf("[+] kpm_alt_pstore 加载成功\n");
+    }
+    usleep(200000);
+
     printf("[*] 卸载旧模块 (如有)...\n");
     sc_kpm_unload(KPM_KEY, KPM_NAME);
     usleep(200000);
@@ -204,6 +216,7 @@ int main(int argc, char *argv[])
     // --- 清理 ---
     close(anon_fd);
     kpm_unload(KPM_KEY, KPM_NAME);
+    kpm_unload(KPM_KEY, "kpm_alt_pstore");
 
     CLEANUP_EXIT(0);
 }
