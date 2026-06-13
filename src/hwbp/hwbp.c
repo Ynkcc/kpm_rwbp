@@ -68,7 +68,7 @@
 #endif
 
 // 最大保存的命中记录数
-#define MAX_HIT_RECORDS_PER_BP 64
+#define MAX_HIT_RECORDS_PER_BP 16
 
 // 寄存器快照结构体
 struct bp_regs_snapshot {
@@ -392,18 +392,23 @@ static bool toggle_bp_registers_directly(uint64_t bp_addr, uint32_t bp_type, uin
     return false;
 }
 
+static void write_wp_regs_on_cpu(void *info);
+
 static void recovery_bp_work_func(struct work_struct *work) {
     struct bp_node *node = container_of(work, struct bp_node, recovery_work);
-    if (node->scheme == 4) {
-        struct perf_event_attr disabled_attr = node->orig_attr;
-        disabled_attr.disabled = 1;
-        pr_info("[kpm_RWBP] 工作队列: 正在调用 modify_user_hw_breakpoint 禁用硬件断点 %px\n", node->bp);
-        kfunc(modify_user_hw_breakpoint)(node->bp, &disabled_attr);
-    } else {
-        pr_info("[kpm_RWBP] 工作队列: 正在异步重新启用硬件断点 %px\n", node->bp);
+    pr_info("[kpm_RWBP] 工作队列: 正在异步恢复硬件断点 %px, scheme=%u\n", node->bp, node->scheme);
+    if (node->scheme == 3) {
+        if (!kf_on_each_cpu) {
+            kf_on_each_cpu = (void *)kallsyms_lookup_name("on_each_cpu");
+        }
+        if (kf_on_each_cpu) {
+            kf_on_each_cpu(write_wp_regs_on_cpu, node, 0);
+        }
+        pr_info("[kpm_RWBP] Scheme 3: 硬件断点全CPU广播恢复成功\n");
+    } else if (node->bp) {
         kfunc(perf_event_enable)(node->bp);
-        node->is_temp_bp = false;
     }
+    node->is_temp_bp = false;
 }
 
 static bool arm64_move_bp_to_next_instruction(struct perf_event *bp, uint64_t next_instruction_addr, struct perf_event_attr *original_attr, struct perf_event_attr *next_instruction_attr) {
@@ -442,26 +447,52 @@ void before_watchpoint_handler(hook_fargs3_t *args, void *udata) {
     unsigned long addr = (unsigned long)args->arg0;
     struct pt_regs *regs = (struct pt_regs *)args->arg2;
     unsigned long flags;
-    struct bp_node *pos;
-    bool found = false;
+    struct bp_node *pos, *found_node = NULL;
 
     flags = spin_lock_irqsave(&bp_list_lock);
     list_for_each_entry(pos, &bp_list, list) {
         if (pos->scheme == 3 && pos->pid == __task_pid_nr_ns(current, PIDTYPE_TGID, 0)) {
             uint64_t hw_addr = calc_hw_addr(pos->addr, pos->type, pos->len);
             if ((addr & ~7ULL) == hw_addr) {
-                pos->hit_count++;
-                found = true;
+                if (!pos->is_temp_bp) {
+                    pos->hit_count++;
+                    pos->is_temp_bp = true;
+                    found_node = pos;
+                }
                 break;
             }
         }
     }
     spin_unlock_irqrestore(&bp_list_lock, flags);
 
-    if (found) {
+    if (found_node) {
         pr_info("[kpm_RWBP] Scheme 3 Hooked watchpoint triggered! addr=0x%lx, PC=0x%llx\n", addr, regs ? regs->pc : 0);
+        
+        // 保存命中记录到环形缓冲区
+        if (regs) {
+            unsigned long rec_flags = spin_lock_irqsave(&found_node->hit_records_lock);
+            struct bp_hit_record *rec = &found_node->hit_records[found_node->hit_record_head];
+            rec->hit_time = kf_ktime_get_mono_fast_ns();
+            rec->task_id = (uint32_t)kfunc(__task_pid_nr_ns)(current, PIDTYPE_TGID, 0);
+            rec->hit_addr = found_node->addr;
+            rec->regs_info.pc = regs->pc;
+            rec->regs_info.sp = regs->sp;
+            rec->regs_info.pstate = regs->pstate;
+            uint64_t *reg_ptr = (uint64_t *)regs;
+            for (int i = 0; i < 31; i++) {
+                rec->regs_info.regs[i] = reg_ptr[i];
+            }
+            found_node->hit_record_head = (found_node->hit_record_head + 1) % MAX_HIT_RECORDS_PER_BP;
+            if (found_node->hit_record_count < MAX_HIT_RECORDS_PER_BP) {
+                found_node->hit_record_count++;
+            }
+            spin_unlock_irqrestore(&found_node->hit_records_lock, rec_flags);
+        }
+
         uint64_t ctrl = read_wb_reg(AARCH64_DBG_REG_WCR, 0);
         write_wb_reg(AARCH64_DBG_REG_WCR, 0, ctrl & ~1ULL);
+
+        kfunc(queue_work_on)(0, (struct workqueue_struct *)kf_system_wq, &found_node->recovery_work);
     }
 }
 
@@ -506,7 +537,7 @@ static void unregister_bp_work_func(struct work_struct *work) {
             kf_on_each_cpu = (void *)kallsyms_lookup_name("on_each_cpu");
         }
         if (kf_on_each_cpu) {
-            kf_on_each_cpu(disable_wp_regs_on_cpu, NULL, 1);
+            kf_on_each_cpu(disable_wp_regs_on_cpu, NULL, 0);  // 改为异步调用，避免死锁风险
         }
         pr_info("[kpm_RWBP] Scheme 3: 硬件断点全CPU广播注销成功\n");
     } else if (node->bp) {
@@ -578,7 +609,6 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
 
     if (found_node->scheme == 1) {
         pr_info("[kpm_RWBP] Scheme 1 triggered! PC=0x%llx\n", regs ? regs->pc : 0);
-        toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 0);
         kfunc(perf_event_disable_inatomic)(bp);
         found_node->is_temp_bp = true;
         kfunc(queue_work_on)(0, (struct workqueue_struct *)kf_system_wq, &found_node->recovery_work);
@@ -587,7 +617,6 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
         if (!found_node->is_temp_bp) {
             // First hit (watchpoint)
             pr_info("[kpm_RWBP] Scheme 2 triggered (First Hit)! PC=0x%llx\n", regs ? regs->pc : 0);
-            toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 0);
             if (regs && arm64_move_bp_to_next_instruction(bp, regs->pc + 4, &found_node->orig_attr, &found_node->next_instruction_attr)) {
                 found_node->is_temp_bp = true;
             } else {
@@ -599,21 +628,20 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
             pr_info("[kpm_RWBP] Scheme 2 triggered (Second Hit)! PC=0x%llx\n", regs ? regs->pc : 0);
             if (arm64_recovery_bp_to_original(bp, &found_node->orig_attr, &found_node->next_instruction_attr)) {
                 found_node->is_temp_bp = false;
-                toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 1);
             } else {
                 pr_err("[kpm_RWBP] Scheme 2: Failed to restore original bp!\n");
-                toggle_bp_registers_directly(found_node->next_instruction_attr.bp_addr, 4, 4, 0);
                 kfunc(perf_event_disable_inatomic)(bp);
             }
         }
     }
     else if (found_node->scheme == 4) {
         pr_info("[kpm_RWBP] Scheme 4 triggered! PC=0x%llx\n", regs ? regs->pc : 0);
-        toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 0);
         kfunc(perf_event_disable_inatomic)(bp);
+        found_node->is_temp_bp = true;
         kfunc(queue_work_on)(0, (struct workqueue_struct *)kf_system_wq, &found_node->recovery_work);
     }
     else {
+        // Scheme 3 及其他方案：纯硬件断点，直接操作寄存器
         toggle_bp_registers_directly(found_node->addr, found_node->type, found_node->len, 0);
         kfunc(perf_event_disable_inatomic)(bp);
     }
@@ -656,6 +684,7 @@ static void register_bp_work_func(struct work_struct *work) {
               node->hit_record_head = 0;
               node->hit_record_count = 0;
               spin_lock_init(&node->hit_records_lock);
+              my_init_work(&node->recovery_work, recovery_bp_work_func);
             
             flags = spin_lock_irqsave(&bp_list_lock);
             list_add(&node->list, &bp_list);
@@ -665,7 +694,7 @@ static void register_bp_work_func(struct work_struct *work) {
                 kf_on_each_cpu = (void *)kallsyms_lookup_name("on_each_cpu");
             }
             if (kf_on_each_cpu) {
-                kf_on_each_cpu(write_wp_regs_on_cpu, node, 1);
+                kf_on_each_cpu(write_wp_regs_on_cpu, node, 0);  // 改为异步调用，避免死锁风险
             }
             pr_info("[kpm_RWBP] Scheme 3: 硬件断点全CPU广播使能成功\n");
         }
@@ -752,6 +781,7 @@ long register_hwbp(uint32_t pid, uint64_t addr, uint32_t type, uint32_t len, uin
               node->hit_record_head = 0;
               node->hit_record_count = 0;
               spin_lock_init(&node->hit_records_lock);
+              my_init_work(&node->recovery_work, recovery_bp_work_func);
             
             flags = spin_lock_irqsave(&bp_list_lock);
             list_add(&node->list, &bp_list);
@@ -761,7 +791,7 @@ long register_hwbp(uint32_t pid, uint64_t addr, uint32_t type, uint32_t len, uin
                 kf_on_each_cpu = (void *)kallsyms_lookup_name("on_each_cpu");
             }
             if (kf_on_each_cpu) {
-                kf_on_each_cpu(write_wp_regs_on_cpu, node, 1);
+                kf_on_each_cpu(write_wp_regs_on_cpu, node, 0);  // 改为异步调用，避免死锁风险
             }
             pr_info("[kpm_RWBP] register_hwbp Scheme 3: 硬件断点全CPU广播使能成功\n");
         } else {
