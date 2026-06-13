@@ -6,6 +6,6 @@ tests/target/*.o
 
 # 编译统一输出目录
 out/
-scripts/kallsyms.txt
-scripts/kernel.config
+scripts/*.txt
+scripts/*.config
 *.md
