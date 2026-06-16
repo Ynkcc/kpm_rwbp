@@ -9,3 +9,7 @@ out/
 scripts/*.txt
 scripts/*.config
 *.md
+
+# rust
+target/
+Cargo.lock

@@ -16,7 +16,7 @@ int kpm_load(const char *key, const char *path)
 {
     long ret = sc_kpm_load(key, path, "");
     if (ret != 0) {
-        printf("[-] sc_kpm_load 失败: %ld\n", ret);
+        printf("[-] sc_kpm_load 失败: %ld, errno: %d (%s)\n", ret, errno, strerror(errno));
         return -1;
     }
     return 0;
@@ -25,7 +25,7 @@ int kpm_load(const char *key, const char *path)
 void kpm_unload(const char *key, const char *name)
 {
     long ret = sc_kpm_unload(key, name);
-    printf("[*] kpm_unload 返回: %ld\n", ret);
+    printf("[*] kpm_unload 返回: %ld, errno: %d (%s)\n", ret, errno, strerror(errno));
     if (g_shm) {
         munmap(g_shm, 4096);
         g_shm = NULL;

@@ -3,32 +3,27 @@
 ANDROID_NDK ?= /home/ynk/Android/Sdk/ndk/27.0.12077973
 
 CC = ${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang
-LD = ${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/ld.lld
+LD_LLD = ${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/ld.lld
 STRIP = ${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
 
-CFLAGS = -Wall -O2 -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector -fno-unwind-tables -fno-semantic-interposition -fno-common -mno-outline-atomics
-CFLAGS += -Wno-int-conversion -Isrc/core -Isrc/compat -Isrc/memory -Isrc/hwbp -Isrc/ipc
-
-KP_DIR = $(shell pwd)/../KernelPatch
-
-INCLUDE_DIRS := src . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
-INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
-
-objs := src/core/main.o src/compat/kernel_compat.o src/memory/mem_reader.o src/ipc/dispatcher.o src/hwbp/hwbp.o
+RUST_LIB = target/aarch64-linux-android/release/libkpm_rwbp.a
 out_dir := out
 
-.PHONY: all clean
+.PHONY: all clean rust_build
 
 all: $(out_dir)/kpm_RWBP.kpm
 	$(MAKE) -C tests
 
-$(out_dir)/kpm_RWBP.kpm: ${objs}
-	mkdir -p $(out_dir)
-	${CC} -r -o $@ $^
+rust_build:
+	RUSTFLAGS="-C relocation-model=static -C opt-level=3" rustup run nightly cargo build -Z build-std=core,compiler_builtins --target aarch64-linux-android --release
 
-%.o: %.c
-	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -c -O2 -o $@ $<
+$(out_dir)/kpm_RWBP.kpm: rust_build
+	mkdir -p $(out_dir)
+	printf 'SECTIONS { .text : { *(.text .text.* .gnu.linkonce.t.*) } .rodata : { *(.rodata .rodata.* .gnu.linkonce.r.*) } .data : { *(.data .data.* .gnu.linkonce.d.*) } .bss : { *(.bss .bss.* .gnu.linkonce.b.*) } .kpm.info : { *(.kpm.info) } .kpm.init : { *(.kpm.init) } .kpm.exit : { *(.kpm.exit) } }\n' > /tmp/kpm_merge.ld
+	$(LD_LLD) -r -T /tmp/kpm_merge.ld -o $@ --undefined __kpm_info_name --undefined __kpm_info_version --undefined __kpm_info_license --undefined __kpm_info_author --undefined __kpm_info_description --undefined __kpm_initcall_rwbp_init --undefined __kpm_exitcall_rwbp_exit --undefined memset --undefined memcpy --undefined memcmp --undefined rust_eh_personality $(RUST_LIB)
+	$(STRIP) --remove-section=.eh_frame --strip-debug $@
 
 clean:
-	rm -rf $(out_dir) src/core/*.o src/compat/*.o src/memory/*.o src/ipc/*.o src/hwbp/*.o
+	rm -rf $(out_dir)
+	cargo clean
 	$(MAKE) -C tests clean

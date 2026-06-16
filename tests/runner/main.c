@@ -3,8 +3,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdbool.h>
-#include <sys/wait.h>
-#include <signal.h>
 #include "kpm_ctrl.h"
 #include "case_mem_read.h"
 #include "case_mem_write.h"
@@ -13,7 +11,6 @@
 #include "case_hwbp_self.h"
 #include "../include/supercall.h"
 
-#define DMESG_PATH   "/data/local/tmp/kpm_dmesg.txt"
 #define MAX_RESULTS  16
 
 // 测试结果条目
@@ -28,7 +25,6 @@ static void print_usage(const char *prog)
     printf("  --case <name>     all | mem | mem-write | mem-list | mem-array | hwbp-self | hwbp-target  (默认: all)\n");
     printf("  --scheme <n>      HWBP 方案 1-4，0=全部运行  (默认: 0)\n");
     printf("  --timeout <ms>    单个断点方案超时时间 ms  (默认: 3000)\n");
-    printf("  --no-dmesg        禁用 dmesg 日志同步进程\n");
     printf("  --help\n");
 }
 
@@ -57,13 +53,11 @@ int main(int argc, char *argv[])
     const char *run_case = "all";
     int scheme    = 0;    // 0 = 全部方案
     int timeout   = 3000; // ms
-    bool no_dmesg = false;
 
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "--case")     == 0 && i + 1 < argc) run_case  = argv[++i];
         else if (strcmp(argv[i], "--scheme")   == 0 && i + 1 < argc) scheme    = atoi(argv[++i]);
         else if (strcmp(argv[i], "--timeout")  == 0 && i + 1 < argc) timeout   = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--no-dmesg") == 0) no_dmesg = true;
         else if (strcmp(argv[i], "--help")     == 0) { print_usage(argv[0]); return 0; }
     }
 
@@ -71,30 +65,9 @@ int main(int argc, char *argv[])
            run_case, scheme, timeout);
     fflush(stdout);
 
-    // --- 启动 dmesg 日志同步进程 ---
-    pid_t dmesg_pid = -1;
-    if (!no_dmesg) {
-        dmesg_pid = fork();
-        if (dmesg_pid == 0) {
-            system("rm -f " DMESG_PATH);
-            execlp("su", "su", "-c",
-                   "while true; do dmesg > " DMESG_PATH "; sync; usleep 100000; done",
-                   NULL);
-            perror("[-] dmesg 日志进程启动失败");
-            _exit(1);
-        }
-        printf("[+] dmesg 日志进程已启动 (PID: %d)\n", dmesg_pid);
-        usleep(200000);
-    }
-
 // 统一清理退出宏
 #define CLEANUP_EXIT(code) \
     do { \
-        if (dmesg_pid > 0) { \
-            kill(dmesg_pid, SIGTERM); \
-            waitpid(dmesg_pid, NULL, 0); \
-            printf("[*] dmesg 日志进程已终止\n"); \
-        } \
         return (code); \
     } while (0)
 
@@ -198,16 +171,6 @@ int main(int argc, char *argv[])
         bool ok = run_case_hwbp_target(anon_fd, use_scheme);
         results[result_count++] = (test_result_t){ "hwbp_target", ok };
         printf("\n");
-    }
-
-    // --- 打印 dmesg 关键日志 ---
-    if (!no_dmesg) {
-        sleep(1); // 确保 dmesg 同步
-        printf("[*] =================== DMESG 关键日志 ===================\n");
-        fflush(stdout);
-        system("su -c 'cat " DMESG_PATH "' | grep -E 'kpm_RWBP|hwbp|HWBP|pc 0x'");
-        printf("[*] =======================================================\n");
-        fflush(stdout);
     }
 
     // --- 打印汇总结果 ---

@@ -16,7 +16,7 @@ all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	mkdir -p $(OUT_DIR)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -pie -fPIE -o $@ $^
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
