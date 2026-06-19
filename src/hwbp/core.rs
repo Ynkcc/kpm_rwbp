@@ -216,7 +216,7 @@ pub unsafe extern "C" fn recovery_bp_work_func(work: *mut WorkStruct) {
 
     if (*node).scheme == 3 {
         if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
-            on_each_cpu(write_wp_regs_on_cpu, node as *mut c_void, 0);
+            on_each_cpu(write_wp_regs_on_cpu, node as *mut c_void, 1);
         }
     } else if !(*node).bp.is_null() {
         if let Some(enable_fn) = crate::sym!(perf_event_enable) {
@@ -252,7 +252,7 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
 
     if (*node).scheme == 3 {
         if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
-            on_each_cpu(disable_wp_regs_on_cpu, core::ptr::null_mut(), 0);
+            on_each_cpu(disable_wp_regs_on_cpu, core::ptr::null_mut(), 1);
         }
     } else if !(*node).bp.is_null() {
         if let Some(unreg_fn) = crate::sym!(unregister_hw_breakpoint) {
@@ -602,6 +602,7 @@ pub fn register_hwbp(
             (*node_ptr).hit_record_head = 0;
             (*node_ptr).hit_record_count = 0;
             (*node_ptr).hit_records_lock = RawSpinlock::new();
+            (*node_ptr).hit_records_lock.init();
             (*node_ptr).recovery_work.init(recovery_bp_work_func);
             (*node_ptr).active = AtomicBool::new(true);
 
@@ -611,7 +612,7 @@ pub fn register_hwbp(
             drop(guard);
 
             if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
-                on_each_cpu(write_wp_regs_on_cpu, node_ptr as *mut c_void, 0);
+                on_each_cpu(write_wp_regs_on_cpu, node_ptr as *mut c_void, 1);
             }
             pr_info!("register_hwbp 方案 3: 初始化启用成功");
         }
@@ -671,6 +672,7 @@ pub fn register_hwbp(
         (*node_ptr).hit_record_head = 0;
         (*node_ptr).hit_record_count = 0;
         (*node_ptr).hit_records_lock = RawSpinlock::new();
+        (*node_ptr).hit_records_lock.init();
         (*node_ptr).recovery_work.init(recovery_bp_work_func);
         (*node_ptr).active = AtomicBool::new(true);
 

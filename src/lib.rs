@@ -81,6 +81,9 @@ pub unsafe extern "C" fn rwbp_init(_args: *const u8, _event: *const u8, _reserve
         return e as i64;
     }
 
+    // 初始化全局自旋锁，安全兼容 Debug 内核
+    crate::hwbp::core::BP_LIST_LOCK.init();
+
     // 挂钩系统调用
     let ret_fstatfs = crate::ffi::hook_syscalln(
         44, // __NR_fstatfs

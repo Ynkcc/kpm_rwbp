@@ -211,6 +211,7 @@ pub struct KernelSymbols {
     // Spinlock
     pub _raw_spin_lock_irqsave: Option<unsafe extern "C" fn(lock: *mut c_void) -> usize>,
     pub _raw_spin_unlock_irqrestore: Option<unsafe extern "C" fn(lock: *mut c_void, flags: usize)>,
+    pub _raw_spin_lock_init: Option<unsafe extern "C" fn(lock: *mut c_void)>,
 
     // 内存拷贝
     pub __arch_copy_to_user: Option<unsafe extern "C" fn(to: *mut c_void, from: *const c_void, n: u64) -> u64>,
@@ -276,6 +277,7 @@ pub static mut SYMS: KernelSymbols = KernelSymbols {
     valid_phys_addr_range: None,
     _raw_spin_lock_irqsave: None,
     _raw_spin_unlock_irqrestore: None,
+    _raw_spin_lock_init: None,
     __arch_copy_to_user: None,
     __arch_copy_from_user: None,
     copy_from_user_nofault: None,
@@ -335,6 +337,8 @@ pub unsafe fn init_symbols() -> Result<(), i32> {
         .or_else(|| lookup_sym("raw_spin_lock_irqsave")).ok_or(-2)?;
     (*syms_ptr)._raw_spin_unlock_irqrestore = lookup_sym("_raw_spin_unlock_irqrestore")
         .or_else(|| lookup_sym("raw_spin_unlock_irqrestore")).ok_or(-2)?;
+    (*syms_ptr)._raw_spin_lock_init = lookup_sym("_raw_spin_lock_init")
+        .or_else(|| lookup_sym("raw_spin_lock_init"));
         
     // __arch_copy_to_user 在新内核中可能被重命名为 copy_to_user
     (*syms_ptr).__arch_copy_to_user = lookup_sym("__arch_copy_to_user")

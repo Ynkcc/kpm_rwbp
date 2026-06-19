@@ -12,6 +12,15 @@ impl RawSpinlock {
         Self { opaque: [0; 64] }
     }
 
+    /// 动态初始化自旋锁（如果内核导出了初始化函数）
+    pub fn init(&self) {
+        unsafe {
+            if let Some(init_fn) = crate::sym!(_raw_spin_lock_init) {
+                init_fn(self as *const RawSpinlock as *mut _);
+            }
+        }
+    }
+
     /// 获取自旋锁，会关中断并保存当前中断标志
     pub fn lock(&self) -> SpinlockGuard<'_> {
         let mut flags = 0usize;
