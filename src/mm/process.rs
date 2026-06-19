@@ -121,7 +121,64 @@ pub unsafe fn pgtable_phys(pgd_va: u64, va: u64) -> u64 {
     }
 }
 
-/// 读取指定进程的用户虚拟内存数据，并安全写入另一个用户态虚拟地址（零拷贝直接读取）
+#[derive(Clone, Copy)]
+struct PmdWalkResult {
+    is_table: bool,
+    is_block: bool,
+    pte_table_va: u64,
+    block_phys_base: u64,
+}
+
+unsafe fn walk_to_pmd(pgd_va: u64, va: u64, paging: &Arm64Paging) -> PmdWalkResult {
+    let pxd_bits = paging.pxd_bits;
+    let pxd_ptrs = paging.pxd_ptrs;
+    let mut cur_pxd_va = pgd_va;
+
+    for lv in (4 - paging.page_level)..=2 {
+        let pxd_shift = pxd_bits * (4 - lv) + 3;
+        let pxd_index = ((va >> pxd_shift) & (pxd_ptrs - 1)) as usize;
+
+        let pxd_entry_ptr = (cur_pxd_va + (pxd_index as u64 * 8)) as *const u64;
+        let pxd_desc = *pxd_entry_ptr;
+
+        let valid_table = pxd_desc & 0b11;
+        if valid_table == 0b11 {
+            let mask = ((1u64 << (48 - paging.page_shift)) - 1) << paging.page_shift;
+            let pxd_pa = pxd_desc & mask;
+            if lv == 2 {
+                return PmdWalkResult {
+                    is_table: true,
+                    is_block: false,
+                    pte_table_va: pxd_pa.wrapping_add(crate::ffi::SYMS.linear_voffset),
+                    block_phys_base: 0,
+                };
+            }
+            cur_pxd_va = pxd_pa.wrapping_add(crate::ffi::SYMS.linear_voffset);
+        } else if valid_table == 0b01 {
+            let bits_val = (3 - lv) * pxd_bits;
+            let block_bits = bits_val + paging.page_shift;
+            let mask = ((1u64 << (48 - block_bits)) - 1) << block_bits;
+            let block_pa = pxd_desc & mask;
+            return PmdWalkResult {
+                is_table: false,
+                is_block: true,
+                pte_table_va: 0,
+                block_phys_base: block_pa,
+            };
+        } else {
+            break;
+        }
+    }
+
+    PmdWalkResult {
+        is_table: false,
+        is_block: false,
+        pte_table_va: 0,
+        block_phys_base: 0,
+    }
+}
+
+/// 读取指定进程的用户虚拟内存数据，并安全写入另一个用户态虚拟地址（零拷贝直接读取，支持PTE缓存）
 pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64) -> Result<usize, i32> {
     let task = unsafe {
         if let Some(find_fn) = crate::sym!(find_task_by_vpid) {
@@ -167,12 +224,49 @@ pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64)
 
     static ZERO_BUF: [u8; 4096] = [0u8; 4096];
 
+    let mut last_pmd_base = !0u64;
+    let mut cached_res = PmdWalkResult {
+        is_table: false,
+        is_block: false,
+        pte_table_va: 0,
+        block_phys_base: 0,
+    };
+
     while remaining > 0 {
         let offset_in_page = cur_vaddr & (page_size - 1);
         let bytes_left_in_page = page_size - offset_in_page;
         let chunk = core::cmp::min(remaining, bytes_left_in_page as usize);
 
-        let phys_addr = unsafe { pgtable_phys(pgd_va, cur_vaddr) };
+        let pmd_size = 1u64 << (paging.page_shift + paging.pxd_bits);
+        let cur_pmd_base = cur_vaddr & !(pmd_size - 1);
+
+        if cur_pmd_base != last_pmd_base {
+            cached_res = unsafe { walk_to_pmd(pgd_va, cur_vaddr, &paging) };
+            last_pmd_base = cur_pmd_base;
+        }
+
+        let phys_addr = if cached_res.is_block {
+            cached_res.block_phys_base + (cur_vaddr & (pmd_size - 1))
+        } else if cached_res.is_table && cached_res.pte_table_va != 0 {
+            let pte_index = ((cur_vaddr >> paging.page_shift) & (paging.pxd_ptrs - 1)) as usize;
+            let pte_entry_ptr = (cached_res.pte_table_va + (pte_index as u64 * 8)) as *const u64;
+            let pte_desc = unsafe { *pte_entry_ptr };
+            let valid_page = pte_desc & 0b11;
+            if valid_page == 0b11 || valid_page == 0b01 {
+                let mask = ((1u64 << (48 - paging.page_shift)) - 1) << paging.page_shift;
+                let page_pa = pte_desc & mask;
+                if page_pa != 0 {
+                    page_pa + (cur_vaddr & (page_size - 1))
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
         if phys_addr == 0 {
             // 页被换出或未映射，跳过并填零
             let mut zero_rem = chunk;
@@ -211,7 +305,7 @@ pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64)
     Ok(total_copied)
 }
 
-/// 从一个用户态源虚拟地址，安全写入指定进程的虚拟内存中（零拷贝直接写入）
+/// 从一个用户态源虚拟地址，安全写入指定进程的虚拟内存中（零拷贝直接写入，支持PTE缓存）
 pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64) -> Result<usize, i32> {
     let task = unsafe {
         if let Some(find_fn) = crate::sym!(find_task_by_vpid) {
@@ -255,12 +349,49 @@ pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64)
     let mut cur_src = src_user_addr;
     let mut total_written = 0;
 
+    let mut last_pmd_base = !0u64;
+    let mut cached_res = PmdWalkResult {
+        is_table: false,
+        is_block: false,
+        pte_table_va: 0,
+        block_phys_base: 0,
+    };
+
     while remaining > 0 {
         let offset_in_page = cur_vaddr & (page_size - 1);
         let bytes_left_in_page = page_size - offset_in_page;
         let chunk = core::cmp::min(remaining, bytes_left_in_page as usize);
 
-        let phys_addr = unsafe { pgtable_phys(pgd_va, cur_vaddr) };
+        let pmd_size = 1u64 << (paging.page_shift + paging.pxd_bits);
+        let cur_pmd_base = cur_vaddr & !(pmd_size - 1);
+
+        if cur_pmd_base != last_pmd_base {
+            cached_res = unsafe { walk_to_pmd(pgd_va, cur_vaddr, &paging) };
+            last_pmd_base = cur_pmd_base;
+        }
+
+        let phys_addr = if cached_res.is_block {
+            cached_res.block_phys_base + (cur_vaddr & (pmd_size - 1))
+        } else if cached_res.is_table && cached_res.pte_table_va != 0 {
+            let pte_index = ((cur_vaddr >> paging.page_shift) & (paging.pxd_ptrs - 1)) as usize;
+            let pte_entry_ptr = (cached_res.pte_table_va + (pte_index as u64 * 8)) as *const u64;
+            let pte_desc = unsafe { *pte_entry_ptr };
+            let valid_page = pte_desc & 0b11;
+            if valid_page == 0b11 || valid_page == 0b01 {
+                let mask = ((1u64 << (48 - paging.page_shift)) - 1) << paging.page_shift;
+                let page_pa = pte_desc & mask;
+                if page_pa != 0 {
+                    page_pa + (cur_vaddr & (page_size - 1))
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
         if phys_addr == 0 {
             // 页未映射，无法写入，终止
             break;

@@ -22,7 +22,11 @@ int kpm_load(const char *key, const char *path)
 void kpm_unload(const char *key, const char *name)
 {
     long ret = sc_kpm_unload(key, name);
-    printf("[*] kpm_unload 返回: %ld, errno: %d (%s)\n", ret, errno, strerror(errno));
+    if (ret != 0) {
+        printf("[-] kpm_unload 失败: %ld, errno: %d (%s)\n", ret, errno, strerror(errno));
+    } else {
+        printf("[+] kpm_unload 成功\n");
+    }
 }
 
 int get_anon_fd(void)
