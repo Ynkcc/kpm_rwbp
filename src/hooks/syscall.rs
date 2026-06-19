@@ -45,7 +45,6 @@ pub unsafe fn handle_cleanup() {
 pub unsafe extern "C" fn rwbp_fstatfs_hook(args: *mut crate::ffi::hook_fargs4_t, _udata: *mut c_void) {
     let arg0 = get_syscall_arg(args as *mut c_void, 0);
     let arg1 = get_syscall_arg(args as *mut c_void, 1);
-    pr_info!("rwbp_fstatfs_hook: arg0=0x{:x}, arg1=0x{:x}", arg0, arg1);
 
     // 1. 检查控制魔数 - arg1 应该是 0xDEADC0DE
     if arg1 != 0xDEADC0DEu64 {
@@ -60,80 +59,96 @@ pub unsafe extern "C" fn rwbp_fstatfs_hook(args: *mut crate::ffi::hook_fargs4_t,
         return;
     }
 
-    // 3. 握手与请求分发逻辑
-    let shm_user_vaddr = SHM_USER_VADDR.load(Ordering::SeqCst);
-    if shm_user_vaddr == 0 {
-        pr_info!("收到共享内存通道握手请求，用户虚拟地址: 0x{:x}", arg0);
-        let mut magic_val = 0u32;
-        let copy_res = crate::mm::copy_from_user(
-            core::slice::from_raw_parts_mut(&mut magic_val as *mut u32 as *mut u8, 4),
-            arg0 as *const c_void,
-        );
+    let cmd = get_syscall_arg(args as *mut c_void, 2) as u32;
+    let user_ptr = arg0 as *const c_void;
 
-        if copy_res.is_ok() && magic_val == crate::ipc::SHM_MAGIC {
-            SHM_USER_VADDR.store(arg0, Ordering::SeqCst);
-            CURRENT_CONTROL_TASK.store(current as u64, Ordering::SeqCst);
-            // 返回 0 表示成功，测试程序会把它当作有效返回值
-            syscall_set_retval(args as *mut c_void, 0);
-            syscall_set_handled(args as *mut c_void, true);
-            pr_info!("成功绑定共享内存通道，虚拟地址: 0x{:x}", arg0);
-        } else {
-            pr_warn!("共享内存 Magic 校验失败！magic=0x{:x}, err={:?}", magic_val, copy_res);
-            syscall_set_retval(args as *mut c_void, -22i64 as u64); // -EINVAL
-            syscall_set_handled(args as *mut c_void, true);
-        }
-    } else {
-        let malloc_fn = match crate::sym!(__kmalloc) {
-            Some(f) => f,
-            None => {
-                syscall_set_retval(args as *mut c_void, -38i64 as u64); // -ENOSYS
-                syscall_set_handled(args as *mut c_void, true);
-                return;
+    let ret: i64 = match cmd {
+        crate::ipc::protocol::OP_READ_MEM => {
+            let mut rcmd = core::mem::zeroed::<crate::ipc::protocol::CopyMemory>();
+            let rcmd_slice = core::slice::from_raw_parts_mut(&mut rcmd as *mut _ as *mut u8, core::mem::size_of::<crate::ipc::protocol::CopyMemory>());
+            if let Err(err) = crate::mm::copy_from_user(rcmd_slice, user_ptr) {
+                err as i64
+            } else {
+                match crate::mm::read_process_memory(rcmd.pid, rcmd.addr, rcmd.size, rcmd.buffer) {
+                    Ok(read_res) => read_res as i64,
+                    Err(err) => err as i64,
+                }
             }
-        };
-        let kfree_fn = match crate::sym!(kfree) {
-            Some(f) => f,
-            None => {
-                syscall_set_retval(args as *mut c_void, -38i64 as u64); // -ENOSYS
-                syscall_set_handled(args as *mut c_void, true);
-                return;
-            }
-        };
-
-        // 动态分配缓冲区，避免内核栈溢出
-        let local_shm = malloc_fn(core::mem::size_of::<crate::ipc::ShmChannel>(), 0xcc0u32) as *mut crate::ipc::ShmChannel;
-        if local_shm.is_null() {
-            syscall_set_retval(args as *mut c_void, -12i64 as u64); // -ENOMEM
-            syscall_set_handled(args as *mut c_void, true);
-            return;
         }
-
-        let copy_res = crate::mm::copy_from_user(
-            core::slice::from_raw_parts_mut(local_shm as *mut u8, core::mem::size_of::<crate::ipc::ShmChannel>()),
-            shm_user_vaddr as *const c_void,
-        );
-
-        if copy_res.is_ok() {
-            if (*local_shm).status == 1 {
-                (*local_shm).status = 2; // processing
-                let ret = crate::ipc::rwbp_dispatch(local_shm);
-                (*local_shm).retval = ret as i32;
-                (*local_shm).status = 0; // done
-
-                let write_back_sz = core::mem::offset_of!(crate::ipc::ShmChannel, payload) + (*local_shm).data_size as usize;
-                let _ = crate::mm::copy_to_user(
-                    shm_user_vaddr as *mut c_void,
-                    core::slice::from_raw_parts(local_shm as *const u8, write_back_sz),
-                );
+        crate::ipc::protocol::OP_WRITE_MEM => {
+            let mut wcmd = core::mem::zeroed::<crate::ipc::protocol::WriteMemory>();
+            let wcmd_slice = core::slice::from_raw_parts_mut(&mut wcmd as *mut _ as *mut u8, core::mem::size_of::<crate::ipc::protocol::WriteMemory>());
+            if let Err(err) = crate::mm::copy_from_user(wcmd_slice, user_ptr) {
+                err as i64
+            } else {
+                match crate::mm::write_process_memory(wcmd.pid, wcmd.addr, wcmd.size, wcmd.buffer) {
+                    Ok(write_res) => write_res as i64,
+                    Err(err) => err as i64,
+                }
             }
-        } else {
-            pr_warn!("读取用户态共享内存失败: err={:?}", copy_res);
         }
+        crate::ipc::protocol::OP_SET_HW_BREAKPOINT => {
+            let mut bcmd = core::mem::zeroed::<crate::ipc::protocol::HwBreakpointCmd>();
+            let bcmd_slice = core::slice::from_raw_parts_mut(&mut bcmd as *mut _ as *mut u8, core::mem::size_of::<crate::ipc::protocol::HwBreakpointCmd>());
+            if let Err(err) = crate::mm::copy_from_user(bcmd_slice, user_ptr) {
+                err as i64
+            } else {
+                if CURRENT_CONTROL_TASK.load(Ordering::SeqCst) == 0 {
+                    CURRENT_CONTROL_TASK.store(current as u64, Ordering::SeqCst);
+                }
+                match crate::hwbp::core::register_hwbp(bcmd.pid, bcmd.addr, bcmd.bp_type, bcmd.len, bcmd.scheme) {
+                    Ok(_) => 0,
+                    Err(err) => err as i64,
+                }
+            }
+        }
+        crate::ipc::protocol::OP_REMOVE_HW_BREAKPOINT => {
+            let mut bcmd = core::mem::zeroed::<crate::ipc::protocol::HwBreakpointCmd>();
+            let bcmd_slice = core::slice::from_raw_parts_mut(&mut bcmd as *mut _ as *mut u8, core::mem::size_of::<crate::ipc::protocol::HwBreakpointCmd>());
+            if let Err(err) = crate::mm::copy_from_user(bcmd_slice, user_ptr) {
+                err as i64
+            } else {
+                match crate::hwbp::core::unregister_hwbp(bcmd.pid, bcmd.addr) {
+                    Ok(_) => 0,
+                    Err(err) => err as i64,
+                }
+            }
+        }
+        crate::ipc::protocol::OP_REMOVE_ALL_HW_BREAKPOINT => {
+            match crate::hwbp::core::unregister_all_hwbp() {
+                Ok(_) => 0,
+                Err(err) => err as i64,
+            }
+        }
+        crate::ipc::protocol::OP_READ_HW_BP_INFO => {
+            let mut icmd = core::mem::zeroed::<crate::ipc::protocol::HwbpInfoCmd>();
+            let icmd_slice = core::slice::from_raw_parts_mut(&mut icmd as *mut _ as *mut u8, core::mem::size_of::<crate::ipc::protocol::HwbpInfoCmd>());
+            if let Err(err) = crate::mm::copy_from_user(icmd_slice, user_ptr) {
+                err as i64
+            } else {
+                let mut actual_count = 0;
+                match crate::hwbp::core::read_hwbp_info(
+                    icmd.pid,
+                    icmd.max_count,
+                    icmd.user_buf as *mut c_void,
+                    &mut actual_count,
+                ) {
+                    Ok(_) => {
+                        let actual_count_offset = core::mem::offset_of!(crate::ipc::protocol::HwbpInfoCmd, actual_count);
+                        let dest_ptr = (arg0 + actual_count_offset as u64) as *mut c_void;
+                        let src_slice = &actual_count.to_ne_bytes();
+                        let _ = crate::mm::copy_to_user(dest_ptr, src_slice);
+                        0
+                    }
+                    Err(err) => err as i64,
+                }
+            }
+        }
+        _ => -22, // -EINVAL
+    };
 
-        kfree_fn(local_shm as *const c_void);
-        syscall_set_retval(args as *mut c_void, 0);
-        syscall_set_handled(args as *mut c_void, true);
-    }
+    syscall_set_retval(args as *mut c_void, ret as u64);
+    syscall_set_handled(args as *mut c_void, true);
 }
 
 // __NR_exit_group (94) 系统调用拦截 Hook，在控制进程退出时清理资源

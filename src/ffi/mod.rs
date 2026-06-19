@@ -6,7 +6,7 @@ use core::ffi::c_int;
 pub mod offsets;
 pub mod symbols;
 
-pub use offsets::{TaskStructOffset, CredOffset};
+pub use offsets::{TaskStructOffset, CredOffset, MmStructOffset};
 pub use symbols::{
     PerfEventAttr, lookup_sym, init_symbols, kver, SYMS,
     has_syscall_wrapper, kallsyms_lookup_name,
@@ -23,7 +23,7 @@ pub use symbols::{
     write_kstorage, read_kstorage, get_kstorage, remove_kstorage,
     hotpatch, hotpatch_nosync,
     // 结构体偏移（KP 导出）
-    task_struct_offset, cred_offset,
+    task_struct_offset, cred_offset, mm_struct_offset,
 };
 
 /// 拦截时用于保留寄存器或局部私有上下文的内核数据块

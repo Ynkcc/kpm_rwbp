@@ -46,135 +46,242 @@ pub fn copy_from_user(to: &mut [u8], from: *const c_void) -> Result<(), i32> {
     Err(-14) // EFAULT
 }
 
-/// 读取指定进程的用户虚拟内存数据，并安全写入另一个用户态虚拟地址（或内核虚拟地址）
+struct Arm64Paging {
+    page_shift: u64,
+    page_size: u64,
+    page_level: u64,
+    pxd_bits: u64,
+    pxd_ptrs: u64,
+}
+
+impl Arm64Paging {
+    fn new() -> Self {
+        let tcr_el1: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, tcr_el1", out(reg) tcr_el1);
+        }
+        let t1sz = (tcr_el1 >> 16) & 0x3f;
+        let va_bits = 64 - t1sz;
+        let tg1 = (tcr_el1 >> 30) & 3;
+        let page_shift = match tg1 {
+            1 => 14,
+            3 => 16,
+            _ => 12,
+        };
+        let page_size = 1u64 << page_shift;
+        let page_level = (va_bits - 4) / (page_shift - 3);
+        let pxd_bits = page_shift - 3;
+        let pxd_ptrs = 1u64 << pxd_bits;
+
+        Self {
+            page_shift,
+            page_size,
+            page_level,
+            pxd_bits,
+            pxd_ptrs,
+        }
+    }
+}
+
+pub unsafe fn pgtable_phys(pgd_va: u64, va: u64) -> u64 {
+    let paging = Arm64Paging::new();
+    let pxd_bits = paging.pxd_bits;
+    let pxd_ptrs = paging.pxd_ptrs;
+    let mut cur_pxd_va = pgd_va;
+    let mut pxd_pa = 0;
+
+    for lv in (4 - paging.page_level)..4 {
+        let pxd_shift = pxd_bits * (4 - lv) + 3;
+        let pxd_index = ((va >> pxd_shift) & (pxd_ptrs - 1)) as usize;
+
+        let pxd_entry_ptr = (cur_pxd_va + (pxd_index as u64 * 8)) as *const u64;
+        let pxd_desc = *pxd_entry_ptr;
+
+        let valid_table = pxd_desc & 0b11;
+        if valid_table == 0b11 {
+            let mask = ((1u64 << (48 - paging.page_shift)) - 1) << paging.page_shift;
+            pxd_pa = pxd_desc & mask;
+        } else if valid_table == 0b01 {
+            let bits_val = (3 - lv) * pxd_bits;
+            let block_bits = bits_val + paging.page_shift;
+            let mask = ((1u64 << (48 - block_bits)) - 1) << block_bits;
+            pxd_pa = (pxd_desc & mask) + (va & (((1u64 << bits_val) - 1) << paging.page_shift));
+            break;
+        } else {
+            return 0;
+        }
+
+        cur_pxd_va = pxd_pa.wrapping_add(crate::ffi::SYMS.linear_voffset);
+    }
+
+    if pxd_pa != 0 {
+        pxd_pa + (va & (paging.page_size - 1))
+    } else {
+        0
+    }
+}
+
+/// 读取指定进程的用户虚拟内存数据，并安全写入另一个用户态虚拟地址（零拷贝直接读取）
 pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64) -> Result<usize, i32> {
     let task = unsafe {
         if let Some(find_fn) = crate::sym!(find_task_by_vpid) {
             find_fn(pid as i32)
         } else {
-            core::ptr::null_mut()
+            return Err(-3); // ESRCH
         }
     };
     if task.is_null() {
         return Err(-3); // ESRCH
     }
 
-    let access_fn = match crate::sym!(access_process_vm) {
-        Some(f) => f,
-        None => return Err(-38), // ENOSYS
+    let mm = unsafe {
+        if let Some(get_mm_fn) = crate::sym!(get_task_mm) {
+            get_mm_fn(task)
+        } else {
+            return Err(-14); // EFAULT
+        }
     };
+    if mm.is_null() {
+        return Err(-14); // EFAULT
+    }
+
+    let pgd_offset = unsafe { crate::ffi::mm_struct_offset.pgd_offset } as usize;
+    let pgd_addr = (mm as usize + pgd_offset) as *const u64;
+    let pgd_va = unsafe { *pgd_addr };
+    if pgd_va == 0 {
+        unsafe {
+            if let Some(mmput_fn) = crate::sym!(mmput) {
+                mmput_fn(mm);
+            }
+        }
+        return Err(-14);
+    }
+
+    let paging = Arm64Paging::new();
+    let page_size = paging.page_size;
 
     let mut remaining = size as usize;
     let mut cur_vaddr = vaddr;
     let mut cur_outbuf = dest_user_addr;
     let mut total_copied = 0;
-    let mut kbuf = [0u8; 4096];
+
+    static ZERO_BUF: [u8; 4096] = [0u8; 4096];
 
     while remaining > 0 {
-        let chunk = core::cmp::min(remaining, kbuf.len());
-        let read_bytes = unsafe {
-            access_fn(task, cur_vaddr, kbuf.as_mut_ptr() as *mut c_void, chunk as i32, 0)
-        };
-        if read_bytes <= 0 {
-            break;
-        }
+        let offset_in_page = cur_vaddr & (page_size - 1);
+        let bytes_left_in_page = page_size - offset_in_page;
+        let chunk = core::cmp::min(remaining, bytes_left_in_page as usize);
 
-        let copied = read_bytes as usize;
-        let copy_err = if cur_outbuf >= 0xffff000000000000u64 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    kbuf.as_ptr(),
-                    cur_outbuf as *mut u8,
-                    copied,
-                );
+        let phys_addr = unsafe { pgtable_phys(pgd_va, cur_vaddr) };
+        if phys_addr == 0 {
+            // 页被换出或未映射，跳过并填零
+            let mut zero_rem = chunk;
+            let mut cur_zero_out = cur_outbuf;
+            while zero_rem > 0 {
+                let zero_chunk = core::cmp::min(zero_rem, ZERO_BUF.len());
+                if let Err(_) = copy_to_user(cur_zero_out as *mut c_void, &ZERO_BUF[..zero_chunk]) {
+                    break;
+                }
+                zero_rem -= zero_chunk;
+                cur_zero_out += zero_chunk as u64;
             }
-            0
+            if zero_rem > 0 {
+                break;
+            }
         } else {
-            match copy_to_user(cur_outbuf as *mut c_void, &kbuf[..copied]) {
-                Ok(_) => 0,
-                Err(_) => copied,
+            let kva = phys_addr.wrapping_add(unsafe { crate::ffi::SYMS.linear_voffset });
+            let kva_slice = unsafe { core::slice::from_raw_parts(kva as *const u8, chunk) };
+            if let Err(_) = copy_to_user(cur_outbuf as *mut c_void, kva_slice) {
+                break;
             }
-        };
-
-        let successful_copied = copied - copy_err;
-        total_copied += successful_copied;
-
-        if successful_copied < chunk {
-            break;
         }
 
-        remaining -= successful_copied;
-        cur_vaddr += successful_copied as u64;
-        cur_outbuf += successful_copied as u64;
+        total_copied += chunk;
+        remaining -= chunk;
+        cur_vaddr += chunk as u64;
+        cur_outbuf += chunk as u64;
+    }
+
+    unsafe {
+        if let Some(mmput_fn) = crate::sym!(mmput) {
+            mmput_fn(mm);
+        }
     }
 
     Ok(total_copied)
 }
 
-/// 从一个用户态（或内核态）源虚拟地址，安全写入指定进程的虚拟内存中
+/// 从一个用户态源虚拟地址，安全写入指定进程的虚拟内存中（零拷贝直接写入）
 pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64) -> Result<usize, i32> {
     let task = unsafe {
         if let Some(find_fn) = crate::sym!(find_task_by_vpid) {
             find_fn(pid as i32)
         } else {
-            core::ptr::null_mut()
+            return Err(-3); // ESRCH
         }
     };
     if task.is_null() {
         return Err(-3); // ESRCH
     }
 
-    let access_fn = match crate::sym!(access_process_vm) {
-        Some(f) => f,
-        None => return Err(-38), // ENOSYS
+    let mm = unsafe {
+        if let Some(get_mm_fn) = crate::sym!(get_task_mm) {
+            get_mm_fn(task)
+        } else {
+            return Err(-14); // EFAULT
+        }
     };
+    if mm.is_null() {
+        return Err(-14); // EFAULT
+    }
+
+    let pgd_offset = unsafe { crate::ffi::mm_struct_offset.pgd_offset } as usize;
+    let pgd_addr = (mm as usize + pgd_offset) as *const u64;
+    let pgd_va = unsafe { *pgd_addr };
+    if pgd_va == 0 {
+        unsafe {
+            if let Some(mmput_fn) = crate::sym!(mmput) {
+                mmput_fn(mm);
+            }
+        }
+        return Err(-14);
+    }
+
+    let paging = Arm64Paging::new();
+    let page_size = paging.page_size;
 
     let mut remaining = size as usize;
     let mut cur_vaddr = vaddr;
     let mut cur_src = src_user_addr;
     let mut total_written = 0;
-    let mut kbuf = [0u8; 4096];
 
     while remaining > 0 {
-        let chunk = core::cmp::min(remaining, kbuf.len());
-        let copy_err = if cur_src >= 0xffff000000000000u64 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    cur_src as *const u8,
-                    kbuf.as_mut_ptr(),
-                    chunk,
-                );
-            }
-            0
-        } else {
-            match copy_from_user(&mut kbuf[..chunk], cur_src as *const c_void) {
-                Ok(_) => 0,
-                Err(_) => chunk,
-            }
-        };
+        let offset_in_page = cur_vaddr & (page_size - 1);
+        let bytes_left_in_page = page_size - offset_in_page;
+        let chunk = core::cmp::min(remaining, bytes_left_in_page as usize);
 
-        let to_write = chunk - copy_err;
-        if to_write == 0 {
+        let phys_addr = unsafe { pgtable_phys(pgd_va, cur_vaddr) };
+        if phys_addr == 0 {
+            // 页未映射，无法写入，终止
             break;
         }
 
-        let written = unsafe {
-            access_fn(task, cur_vaddr, kbuf.as_mut_ptr() as *mut c_void, to_write as i32, 0x01) // FOLL_WRITE 是 0x01
-        };
-        if written <= 0 {
+        let kva = phys_addr.wrapping_add(unsafe { crate::ffi::SYMS.linear_voffset });
+        let kva_slice = unsafe { core::slice::from_raw_parts_mut(kva as *mut u8, chunk) };
+        if let Err(_) = copy_from_user(kva_slice, cur_src as *const c_void) {
             break;
         }
 
-        let written_bytes = written as usize;
-        total_written += written_bytes;
+        total_written += chunk;
+        remaining -= chunk;
+        cur_vaddr += chunk as u64;
+        cur_src += chunk as u64;
+    }
 
-        if written_bytes < to_write {
-            break;
+    unsafe {
+        if let Some(mmput_fn) = crate::sym!(mmput) {
+            mmput_fn(mm);
         }
-
-        remaining -= written_bytes;
-        cur_vaddr += written_bytes as u64;
-        cur_src += written_bytes as u64;
     }
 
     Ok(total_written)

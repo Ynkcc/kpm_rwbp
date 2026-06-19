@@ -102,6 +102,7 @@ unsafe extern "C" {
     // 结构体偏移（KP 导出）
     pub static mut task_struct_offset: TaskStructOffset;
     pub static mut cred_offset: CredOffset;
+    pub static mut mm_struct_offset: super::offsets::MmStructOffset;
 
     // Syscall 表
     pub static sys_call_table: *mut c_void;

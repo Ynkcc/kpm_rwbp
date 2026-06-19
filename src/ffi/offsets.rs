@@ -53,3 +53,29 @@ pub struct CredOffset {
     pub security_offset: i16,
     pub rcu_offset: i16,
 }
+
+/// 对应内核中 mm_struct 的关键字段偏移
+#[repr(C)]
+pub struct MmStructOffset {
+    pub mmap_base_offset: i16,
+    pub task_size_offset: i16,
+    pub pgd_offset: i16,
+    pub map_count_offset: i16,
+    pub total_vm_offset: i16,
+    pub locked_vm_offset: i16,
+    pub pinned_vm_offset: i16,
+    pub data_vm_offset: i16,
+    pub exec_vm_offset: i16,
+    pub stack_vm_offset: i16,
+    pub start_code_offset: i16,
+    pub end_code_offset: i16,
+    pub start_data_offset: i16,
+    pub end_data_offset: i16,
+    pub start_brk_offset: i16,
+    pub brk_offset: i16,
+    pub start_stack_offset: i16,
+    pub arg_start_offset: i16,
+    pub arg_end_offset: i16,
+    pub env_start_offset: i16,
+    pub env_end_offset: i16,
+}
