@@ -62,9 +62,8 @@ pub struct HwbpNode {
     pub scheme: u32,
     pub next_instruction_attr: PerfEventAttr,
     pub hit_records: [HwbpHitRecord; 16],
-    pub hit_record_head: u32,
-    pub hit_record_count: u32,
-    pub hit_records_lock: RawSpinlock,
+    pub hit_record_head: AtomicU64, // 写入游标 (单调递增)
+    pub hit_record_tail: AtomicU64, // 读取游标 (单调递增)
     pub active: AtomicBool,
 }
 
@@ -312,12 +311,12 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
         let node = (curr as usize - node_offset) as *mut HwbpNode;
         if unsafe { (*node).scheme == 3 } {
             let task = get_current();
-            let pid = if let Some(pid_fn) = crate::sym!(__task_pid_nr_ns) {
-                pid_fn(task, 0, core::ptr::null_mut()) as u32
+            let tgid = if let Some(pid_fn) = crate::sym!(__task_pid_nr_ns) {
+                pid_fn(task, 1, core::ptr::null_mut()) as u32
             } else {
                 0
             };
-            if unsafe { (*node).pid == pid && (*node).active.load(Ordering::Acquire) } {
+            if unsafe { (*node).pid == tgid && (*node).active.load(Ordering::Acquire) } {
                 let hw_addr = calc_hw_addr((*node).addr, (*node).bp_type, (*node).len);
                 if (addr & !7u64) == hw_addr {
                     if !(*node).is_temp_bp {
@@ -340,12 +339,15 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
         );
 
         if !regs.is_null() {
-            let rec_guard = unsafe { (*found_node).hit_records_lock.lock() };
-            let head = unsafe { (*found_node).hit_record_head as usize };
-            let rec = unsafe { &mut (*found_node).hit_records[head] };
-            if let Some(mono_ns_fn) = crate::sym!(ktime_get_mono_fast_ns) {
-                rec.hit_time = mono_ns_fn();
-            }
+            // 原子抢占写入槽位
+            let head = unsafe { (*found_node).hit_record_head.fetch_add(1, Ordering::Acquire) };
+            let idx = (head % 16) as usize;
+            let rec = unsafe { &mut (*found_node).hit_records[idx] };
+
+            // 将 hit_time 置零，作为该槽位正在被写入的“Busy”标志
+            unsafe { core::ptr::write_volatile(&mut rec.hit_time, 0); }
+            core::sync::atomic::compiler_fence(Ordering::Release);
+
             let task = get_current();
             if let Some(pid_fn) = crate::sym!(__task_pid_nr_ns) {
                 rec.task_id = pid_fn(task, 0, core::ptr::null_mut()) as u32;
@@ -357,13 +359,14 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
             rec.regs_info.pstate = regs_ref.pstate;
             rec.regs_info.regs.copy_from_slice(&regs_ref.regs[..31]);
 
-            unsafe {
-                (*found_node).hit_record_head = ((*found_node).hit_record_head + 1) % 16;
-                if (*found_node).hit_record_count < 16 {
-                    (*found_node).hit_record_count += 1;
-                }
+            // 内存屏障，确保所有寄存器数据落地
+            core::sync::atomic::compiler_fence(Ordering::Release);
+
+            // 最后填充真实时间，代表写入完成。强制兜底规避返回 0。
+            if let Some(mono_ns_fn) = crate::sym!(ktime_get_mono_fast_ns) {
+                let t = mono_ns_fn();
+                unsafe { core::ptr::write_volatile(&mut rec.hit_time, if t == 0 { 1 } else { t }); }
             }
-            drop(rec_guard);
         }
 
         let ctrl = read_wcr(0);
@@ -406,12 +409,15 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
     unsafe { (*found_node).hit_count.fetch_add(1, Ordering::Relaxed) };
 
     if !pt_regs.is_null() {
-        let rec_guard = unsafe { (*found_node).hit_records_lock.lock() };
-        let head = unsafe { (*found_node).hit_record_head as usize };
-        let rec = unsafe { &mut (*found_node).hit_records[head] };
-        if let Some(mono_ns_fn) = crate::sym!(ktime_get_mono_fast_ns) {
-            rec.hit_time = mono_ns_fn();
-        }
+        // 原子抢占写入槽位
+        let head = unsafe { (*found_node).hit_record_head.fetch_add(1, Ordering::Acquire) };
+        let idx = (head % 16) as usize;
+        let rec = unsafe { &mut (*found_node).hit_records[idx] };
+
+        // 将 hit_time 置零，作为该槽位正在被写入的“Busy”标志
+        unsafe { core::ptr::write_volatile(&mut rec.hit_time, 0); }
+        core::sync::atomic::compiler_fence(Ordering::Release);
+
         let task = unsafe { get_current() };
         if let Some(pid_fn) = crate::sym!(__task_pid_nr_ns) {
             rec.task_id = pid_fn(task, 0, core::ptr::null_mut()) as u32;
@@ -423,13 +429,14 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
         rec.regs_info.pstate = pt_regs_ref.pstate;
         rec.regs_info.regs.copy_from_slice(&pt_regs_ref.regs[..31]);
 
-        unsafe {
-            (*found_node).hit_record_head = ((*found_node).hit_record_head + 1) % 16;
-            if (*found_node).hit_record_count < 16 {
-                (*found_node).hit_record_count += 1;
-            }
+        // 内存屏障，确保所有寄存器数据落地
+        core::sync::atomic::compiler_fence(Ordering::Release);
+
+        // 最后填充真实时间，代表写入完成。强制兜底规避返回 0。
+        if let Some(mono_ns_fn) = crate::sym!(ktime_get_mono_fast_ns) {
+            let t = mono_ns_fn();
+            unsafe { core::ptr::write_volatile(&mut rec.hit_time, if t == 0 { 1 } else { t }); }
         }
-        drop(rec_guard);
     }
 
     pr_info!("=== 硬件断点命中 ===");
@@ -602,10 +609,8 @@ pub fn register_hwbp(
             (*node_ptr).scheme = 3;
             (*node_ptr).hit_count = AtomicU64::new(0);
             (*node_ptr).is_temp_bp = false;
-            (*node_ptr).hit_record_head = 0;
-            (*node_ptr).hit_record_count = 0;
-            (*node_ptr).hit_records_lock = RawSpinlock::new();
-            (*node_ptr).hit_records_lock.init();
+            (*node_ptr).hit_record_head = AtomicU64::new(0);
+            (*node_ptr).hit_record_tail = AtomicU64::new(0);
             (*node_ptr).recovery_work.init(recovery_bp_work_func);
             (*node_ptr).active = AtomicBool::new(true);
 
@@ -672,10 +677,8 @@ pub fn register_hwbp(
         (*node_ptr).hit_count = AtomicU64::new(0);
         (*node_ptr).orig_attr = attr;
         (*node_ptr).is_temp_bp = false;
-        (*node_ptr).hit_record_head = 0;
-        (*node_ptr).hit_record_count = 0;
-        (*node_ptr).hit_records_lock = RawSpinlock::new();
-        (*node_ptr).hit_records_lock.init();
+        (*node_ptr).hit_record_head = AtomicU64::new(0);
+        (*node_ptr).hit_record_tail = AtomicU64::new(0);
         (*node_ptr).recovery_work.init(recovery_bp_work_func);
         (*node_ptr).active = AtomicBool::new(true);
 
@@ -743,8 +746,7 @@ pub fn unregister_hwbp(pid: u32, addr: u64) -> Result<(), i32> {
 
 /// 注销所有的硬件断点
 pub fn unregister_all_hwbp() -> Result<(), i32> {
-    let mut nodes_to_free = [core::ptr::null_mut::<HwbpNode>(); 64];
-    let mut count = 0;
+    let mut head_to_free: *mut HwbpNode = core::ptr::null_mut();
 
     let guard = BP_LIST_LOCK.lock();
     unsafe {
@@ -756,39 +758,39 @@ pub fn unregister_all_hwbp() -> Result<(), i32> {
             let node = (curr as usize - node_offset) as *mut HwbpNode;
             (*node).active.store(false, Ordering::Release);
             (*curr).del_rcu();
-            if count < 64 {
-                nodes_to_free[count] = node;
-                count += 1;
-            } else {
-                pr_err!("unregister_all_hwbp: 需要注销的断点节点数超过 64，发生丢弃！");
-            }
+
+            // 使用 unreg_work.data 串联临时单向链表
+            (*node).unreg_work.data = head_to_free as usize;
+            head_to_free = node;
+
             curr = next;
         }
     }
     drop(guard);
 
-    unsafe {
-        for i in 0..count {
-            let node = nodes_to_free[i];
-            if node.is_null() {
-                continue;
-            }
+    let mut curr_node = head_to_free;
+    while !curr_node.is_null() {
+        unsafe {
+            let next_node = (*curr_node).unreg_work.data as *mut HwbpNode;
+
             IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
-            (*node).unreg_work.init(unregister_bp_work_func);
+            (*curr_node).unreg_work.init(unregister_bp_work_func);
             if let Some(queue_fn) = crate::sym!(queue_work_on) {
                 let success = queue_fn(
                     0,
                     crate::sym!(system_wq),
-                    &mut (*node).unreg_work as *mut _ as *mut c_void,
+                    &mut (*curr_node).unreg_work as *mut _ as *mut c_void,
                 );
                 if success == 0 {
                     IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                    unregister_bp_work_func(&mut (*node).unreg_work);
+                    unregister_bp_work_func(&mut (*curr_node).unreg_work);
                 }
             } else {
                 IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                unregister_bp_work_func(&mut (*node).unreg_work);
+                unregister_bp_work_func(&mut (*curr_node).unreg_work);
             }
+
+            curr_node = next_node;
         }
     }
 
@@ -817,24 +819,36 @@ pub fn read_hwbp_info(
         let node = (curr as usize - node_offset) as *mut HwbpNode;
         unsafe {
             if (*node).pid == pid {
-                let rec_guard = (*node).hit_records_lock.lock();
-                let count = (*node).hit_record_count;
-                let head = (*node).hit_record_head;
+                let head = (*node).hit_record_head.load(Ordering::Acquire);
+                let mut tail = (*node).hit_record_tail.load(Ordering::Acquire);
 
-                let limit = core::cmp::min(count as usize, 16);
-                let limit = core::cmp::min(limit, max_count as usize);
-
-                for i in 0..limit {
-                    let idx = (head + 16 - count + i as u32) % 16;
-                    temp_records[i] = (*node).hit_records[idx as usize];
+                // 极端溢出处理：若生产端积压超过一整圈（16条），强制推进读取游标丢弃旧数据
+                if head > tail + 16 {
+                    tail = head - 16;
                 }
-                count_to_copy = limit;
 
-                // 清空记录标志
-                (*node).hit_record_count = 0;
-                (*node).hit_record_head = 0;
+                let available = core::cmp::min((head - tail) as usize, max_count as usize);
+                let limit = core::cmp::min(available, 16);
 
-                drop(rec_guard);
+                let mut i = 0;
+                while i < limit {
+                    let idx = (tail % 16) as usize;
+                    let rec = &(*node).hit_records[idx];
+
+                    // 遇到 hit_time 为 0 说明该槽位恰好处于异常处理上下文并发写入中，终止并留待下次读取
+                    if core::ptr::read_volatile(&rec.hit_time) == 0 {
+                        break; 
+                    }
+
+                    temp_records[i] = *rec;
+                    tail += 1;
+                    i += 1;
+                }
+                
+                count_to_copy = i;
+                
+                // 将推进后的游标反馈回结构体，下一次 IPC 将从新起点拉取
+                (*node).hit_record_tail.store(tail, Ordering::Release);
                 break;
             }
         }

@@ -9,6 +9,7 @@
 #include "case_mem_list.h"
 #include "case_mem_array.h"
 #include "case_hwbp_self.h"
+#include "case_hwbp_extra.h"
 #include "../include/supercall.h"
 
 #define MAX_RESULTS  16
@@ -22,7 +23,7 @@ typedef struct {
 static void print_usage(const char *prog)
 {
     printf("用法: %s [OPTIONS]\n", prog);
-    printf("  --case <name>     all | mem | mem-write | mem-list | mem-array | hwbp-self | hwbp-target  (默认: all)\n");
+    printf("  --case <name>     all | mem | mem-write | mem-list | mem-array | hwbp-self | hwbp-target | hwbp-scale | hwbp-concurrency  (默认: all)\n");
     printf("  --scheme <n>      HWBP 方案 1-4，0=全部运行  (默认: 0)\n");
     printf("  --timeout <ms>    单个断点方案超时时间 ms  (默认: 3000)\n");
     printf("  --help\n");
@@ -113,6 +114,8 @@ int main(int argc, char *argv[])
     bool do_mem_array = (strcmp(run_case, "all") == 0 || strcmp(run_case, "mem-array") == 0);
     bool do_self      = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-self") == 0);
     bool do_target    = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-target") == 0);
+    bool do_scale     = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-scale") == 0);
+    bool do_concurrency = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-concurrency") == 0);
 
     // case: mem_read
     if (do_mem) {
@@ -170,6 +173,22 @@ int main(int argc, char *argv[])
         int use_scheme = (scheme == 0) ? 1 : scheme; // target 默认用方案 1
         bool ok = run_case_hwbp_target(anon_fd, use_scheme);
         results[result_count++] = (test_result_t){ "hwbp_target", ok };
+        printf("\n");
+    }
+
+    // case: hwbp_scale
+    if (do_scale) {
+        printf("[*] ========== 运行 case: hwbp_scale ==========\n");
+        bool ok = run_case_hwbp_scale(anon_fd);
+        results[result_count++] = (test_result_t){ "hwbp_scale", ok };
+        printf("\n");
+    }
+
+    // case: hwbp_concurrency
+    if (do_concurrency) {
+        printf("[*] ========== 运行 case: hwbp_concurrency ==========\n");
+        bool ok = run_case_hwbp_concurrency(anon_fd);
+        results[result_count++] = (test_result_t){ "hwbp_concurrency", ok };
         printf("\n");
     }
 
