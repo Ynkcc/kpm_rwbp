@@ -84,7 +84,6 @@ pub struct HwbpNode {
     pub hit_record_tail: AtomicU64, // 读取游标 (单调递增)
     pub active: AtomicBool,
     pub refcnt: AtomicI32,
-    pub record_lock: RawSpinlock,
 }
 
 /// 注册断点工作包装结构
@@ -234,16 +233,26 @@ pub unsafe extern "C" fn recovery_bp_work_func(work: *mut WorkStruct) {
     let node = (work as usize - node_offset) as *mut HwbpNode;
     pr_info!("recovery_bp_work_func: 恢复断点 {:p}, 方案 {}", (*node).bp, (*node).scheme);
 
-    if (*node).scheme == 3 {
-        if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
-            on_each_cpu(write_wp_regs_on_cpu, node as *mut c_void, 1);
-        }
-    } else if !(*node).bp.is_null() {
-        if let Some(enable_fn) = crate::sym!(perf_event_enable) {
-            enable_fn((*node).bp);
+    if (*node).active.load(Ordering::Acquire) {
+        if (*node).scheme == 3 {
+            if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
+                on_each_cpu(write_wp_regs_on_cpu, node as *mut c_void, 1);
+            }
+        } else if !(*node).bp.is_null() {
+            if let Some(enable_fn) = crate::sym!(perf_event_enable) {
+                enable_fn((*node).bp);
+            }
         }
     }
     (*node).is_temp_bp.store(false, Ordering::Release);
+    
+    // 递减工作项继承的引用计数。如果是最后一个扣减引用的，则物理释放资源。
+    if (*node).refcnt.fetch_sub(1, Ordering::Release) == 1 {
+        if let Some(free_fn) = crate::sym!(kfree) {
+            free_fn(node as *const c_void);
+        }
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub unsafe extern "C" fn write_wp_regs_on_cpu(info: *mut c_void) {
@@ -270,25 +279,26 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
     let node_offset = core::mem::offset_of!(HwbpNode, unreg_work);
     let node = (work as usize - node_offset) as *mut HwbpNode;
 
-    // 等待所有并发 RCU 读者安全退出临界区
-    if let Some(sync_rcu) = crate::sym!(synchronize_rcu) {
-        sync_rcu();
-    }
-
-    // 递减注册引用并在有读者并发使用时循环等待归零
-    if (*node).refcnt.fetch_sub(1, Ordering::Release) > 1 {
-        while (*node).refcnt.load(Ordering::Acquire) > 0 {
-            if let Some(msleep) = crate::sym!(msleep) {
-                msleep(1);
-            } else {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
     if (*node).scheme == 3 {
-        if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
-            on_each_cpu(disable_wp_regs_on_cpu, core::ptr::null_mut(), 1);
+        let mut has_other_scheme3 = false;
+        let guard = BP_LIST_LOCK.lock();
+        let bp_list_ptr = BP_LIST.get_ptr();
+        let mut curr = (*bp_list_ptr).next;
+        while curr != bp_list_ptr {
+            let node_offset = core::mem::offset_of!(HwbpNode, list);
+            let other_node = (curr as usize - node_offset) as *mut HwbpNode;
+            if other_node != node && (*other_node).scheme == 3 && (*other_node).active.load(Ordering::Acquire) {
+                has_other_scheme3 = true;
+                break;
+            }
+            curr = (*curr).next;
+        }
+        drop(guard);
+
+        if !has_other_scheme3 {
+            if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
+                on_each_cpu(disable_wp_regs_on_cpu, core::ptr::null_mut(), 1);
+            }
         }
     } else if !(*node).bp.is_null() {
         if let Some(unreg_fn) = crate::sym!(unregister_hw_breakpoint) {
@@ -296,10 +306,13 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
         }
     }
 
-    if let Some(free_fn) = crate::sym!(kfree) {
-        free_fn(node as *const c_void);
+    // 递减注册占用引用。如果是最后一个扣减引用的，则物理释放资源。
+    if (*node).refcnt.fetch_sub(1, Ordering::Release) == 1 {
+        if let Some(free_fn) = crate::sym!(kfree) {
+            free_fn(node as *const c_void);
+        }
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
-    IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// ARM64 处理器寄存器布局
@@ -375,9 +388,6 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
         );
 
         if !regs.is_null() {
-            // 局部自旋锁降级保护
-            let record_guard = (*found_node).record_lock.lock();
-
             // 原子抢占写入槽位
             let head = (*found_node).hit_record_head.fetch_add(1, Ordering::Acquire);
             let idx = (head % 16) as usize;
@@ -405,19 +415,28 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
                 let t = mono_ns_fn();
                 core::ptr::write_volatile(&mut rec.hit_time, if t == 0 { 1 } else { t });
             }
-
-            drop(record_guard);
         }
 
         let ctrl = read_wcr(0);
         write_wcr(0, ctrl & !1u64);
 
+        let mut ref_transferred = false;
         if let Some(queue_fn) = crate::sym!(queue_work_on) {
-            queue_fn(0, crate::sym!(system_wq), &mut (*found_node).recovery_work as *mut _ as *mut c_void);
+            let ret = queue_fn(0, crate::sym!(system_wq), &mut (*found_node).recovery_work as *mut _ as *mut c_void);
+            if ret != 0 {
+                ref_transferred = true;
+            }
         }
 
-        // 递减引用计数
-        (*found_node).refcnt.fetch_sub(1, Ordering::Release);
+        // 递减引用计数（如果未成功转移给工作队列）
+        if !ref_transferred {
+            if (*found_node).refcnt.fetch_sub(1, Ordering::Release) == 1 {
+                if let Some(free_fn) = crate::sym!(kfree) {
+                    free_fn(found_node as *const c_void);
+                }
+                IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
     }
 }
 
@@ -459,9 +478,6 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
     unsafe { (*found_node).hit_count.fetch_add(1, Ordering::Relaxed) };
 
     if !pt_regs.is_null() {
-        // 局部自旋锁保护
-        let record_guard = unsafe { (*found_node).record_lock.lock() };
-
         // 原子抢占写入槽位
         let head = unsafe { (*found_node).hit_record_head.fetch_add(1, Ordering::Acquire) };
         let idx = (head % 16) as usize;
@@ -489,8 +505,6 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
             let t = mono_ns_fn();
             unsafe { core::ptr::write_volatile(&mut rec.hit_time, if t == 0 { 1 } else { t }); }
         }
-
-        drop(record_guard);
     }
 
     pr_info!("=== 硬件断点命中 ===");
@@ -506,6 +520,7 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
         dump_fn();
     }
 
+    let mut ref_transferred = false;
     match unsafe { (*found_node).scheme } {
         1 | 4 => {
             if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
@@ -513,11 +528,14 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
             }
             unsafe { (*found_node).is_temp_bp.store(true, Ordering::Release); }
             if let Some(queue_fn) = crate::sym!(queue_work_on) {
-                queue_fn(
+                let ret = queue_fn(
                     0,
                     crate::sym!(system_wq),
                     &mut (*found_node).recovery_work as *mut _ as *mut c_void,
                 );
+                if ret != 0 {
+                    ref_transferred = true;
+                }
             }
         }
         2 => {
@@ -560,8 +578,17 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
         }
     }
 
-    // 结束执行前，递减引用计数
-    unsafe { (*found_node).refcnt.fetch_sub(1, Ordering::Release); }
+    // 结束执行前，如果引用没有转移给恢复工作项，则递减引用计数
+    if !ref_transferred {
+        unsafe {
+            if (*found_node).refcnt.fetch_sub(1, Ordering::Release) == 1 {
+                if let Some(free_fn) = crate::sym!(kfree) {
+                    free_fn(found_node as *const c_void);
+                }
+                IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 unsafe fn arm64_move_bp_to_next_instruction(
@@ -671,8 +698,6 @@ pub fn register_hwbp(
             (*node_ptr).recovery_work.init(recovery_bp_work_func);
             (*node_ptr).active = AtomicBool::new(true);
             (*node_ptr).refcnt = AtomicI32::new(1);
-            (*node_ptr).record_lock = RawSpinlock::new();
-            (*node_ptr).record_lock.init();
 
             let guard = BP_LIST_LOCK.lock();
             let bp_list_ptr = BP_LIST.get_ptr();
@@ -742,8 +767,6 @@ pub fn register_hwbp(
         (*node_ptr).recovery_work.init(recovery_bp_work_func);
         (*node_ptr).active = AtomicBool::new(true);
         (*node_ptr).refcnt = AtomicI32::new(1);
-        (*node_ptr).record_lock = RawSpinlock::new();
-        (*node_ptr).record_lock.init();
 
         let guard = BP_LIST_LOCK.lock();
         let bp_list_ptr = BP_LIST.get_ptr();
@@ -890,9 +913,6 @@ pub fn read_hwbp_info(
                 (*node).refcnt.fetch_add(1, Ordering::Relaxed);
                 found_node = node;
 
-                // 局部自旋锁降级保护
-                let record_guard = (*node).record_lock.lock();
-
                 let head = (*node).hit_record_head.load(Ordering::Acquire);
                 let mut tail = (*node).hit_record_tail.load(Ordering::Acquire);
 
@@ -925,7 +945,6 @@ pub fn read_hwbp_info(
                 
                 // 将推进后的游标反馈回结构体，下一次 IPC 将从新起点拉取
                 (*node).hit_record_tail.store(tail, Ordering::Release);
-                drop(record_guard);
                 break;
             }
         }
@@ -938,7 +957,12 @@ pub fn read_hwbp_info(
         fn drop(&mut self) {
             if !self.0.is_null() {
                 unsafe {
-                    (*self.0).refcnt.fetch_sub(1, Ordering::Release);
+                    if (*self.0).refcnt.fetch_sub(1, Ordering::Release) == 1 {
+                        if let Some(free_fn) = crate::sym!(kfree) {
+                            free_fn(self.0 as *const c_void);
+                        }
+                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                    }
                 }
             }
         }

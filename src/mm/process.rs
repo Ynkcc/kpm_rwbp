@@ -267,8 +267,23 @@ pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64)
             0
         };
 
-        if phys_addr == 0 {
-            // 页被换出或未映射，跳过并填零
+        let mut is_valid = phys_addr != 0;
+        if is_valid {
+            let pfn = phys_addr >> paging.page_shift;
+            let is_valid_pfn = unsafe {
+                if let Some(pfn_fn) = crate::ffi::SYMS.pfn_valid {
+                    pfn_fn(pfn) != 0
+                } else {
+                    true
+                }
+            };
+            if !is_valid_pfn {
+                is_valid = false;
+            }
+        }
+
+        if !is_valid {
+            // 页被换出、未映射或 PFN 无效，跳过并填零
             let mut zero_rem = chunk;
             let mut cur_zero_out = cur_outbuf;
             while zero_rem > 0 {
@@ -308,111 +323,38 @@ pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64)
 /// 从一个用户态源虚拟地址，安全写入指定进程的虚拟内存中（零拷贝直接写入，支持PTE缓存）
 pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64) -> Result<usize, i32> {
     let task = unsafe {
-        if let Some(find_fn) = crate::sym!(find_task_by_vpid) {
-            find_fn(pid as i32)
-        } else {
-            return Err(-3); // ESRCH
-        }
+        let find_fn = crate::sym!(find_task_by_vpid).ok_or(-3)?;
+        let t = find_fn(pid as i32);
+        if t.is_null() { return Err(-3); }
+        t
     };
-    if task.is_null() {
-        return Err(-3); // ESRCH
-    }
 
-    let mm = unsafe {
-        if let Some(get_mm_fn) = crate::sym!(get_task_mm) {
-            get_mm_fn(task)
-        } else {
-            return Err(-14); // EFAULT
-        }
-    };
-    if mm.is_null() {
-        return Err(-14); // EFAULT
-    }
-
-    let pgd_offset = unsafe { crate::ffi::mm_struct_offset.pgd_offset } as usize;
-    let pgd_addr = (mm as usize + pgd_offset) as *const u64;
-    let pgd_va = unsafe { *pgd_addr };
-    if pgd_va == 0 {
-        unsafe {
-            if let Some(mmput_fn) = crate::sym!(mmput) {
-                mmput_fn(mm);
-            }
-        }
-        return Err(-14);
-    }
-
-    let paging = Arm64Paging::new();
-    let page_size = paging.page_size;
-
+    let access_fn = unsafe { crate::sym!(access_process_vm).ok_or(-38)? };
     let mut remaining = size as usize;
     let mut cur_vaddr = vaddr;
     let mut cur_src = src_user_addr;
     let mut total_written = 0;
-
-    let mut last_pmd_base = !0u64;
-    let mut cached_res = PmdWalkResult {
-        is_table: false,
-        is_block: false,
-        pte_table_va: 0,
-        block_phys_base: 0,
-    };
+    
+    let mut kbuf = [0u8; 1024];
 
     while remaining > 0 {
-        let offset_in_page = cur_vaddr & (page_size - 1);
-        let bytes_left_in_page = page_size - offset_in_page;
-        let chunk = core::cmp::min(remaining, bytes_left_in_page as usize);
-
-        let pmd_size = 1u64 << (paging.page_shift + paging.pxd_bits);
-        let cur_pmd_base = cur_vaddr & !(pmd_size - 1);
-
-        if cur_pmd_base != last_pmd_base {
-            cached_res = unsafe { walk_to_pmd(pgd_va, cur_vaddr, &paging) };
-            last_pmd_base = cur_pmd_base;
+        let chunk = core::cmp::min(remaining, kbuf.len());
+        
+        if let Err(_) = copy_from_user(&mut kbuf[..chunk], cur_src as *const c_void) {
+            break;
         }
 
-        let phys_addr = if cached_res.is_block {
-            cached_res.block_phys_base + (cur_vaddr & (pmd_size - 1))
-        } else if cached_res.is_table && cached_res.pte_table_va != 0 {
-            let pte_index = ((cur_vaddr >> paging.page_shift) & (paging.pxd_ptrs - 1)) as usize;
-            let pte_entry_ptr = (cached_res.pte_table_va + (pte_index as u64 * 8)) as *const u64;
-            let pte_desc = unsafe { *pte_entry_ptr };
-            let valid_page = pte_desc & 0b11;
-            if valid_page == 0b11 || valid_page == 0b01 {
-                let mask = ((1u64 << (48 - paging.page_shift)) - 1) << paging.page_shift;
-                let page_pa = pte_desc & mask;
-                if page_pa != 0 {
-                    page_pa + (cur_vaddr & (page_size - 1))
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        } else {
-            0
+        // FOLL_WRITE(0x1) | FOLL_FORCE(0x10) = 0x11
+        let bytes_written = unsafe {
+            access_fn(task, cur_vaddr, kbuf.as_mut_ptr() as *mut c_void, chunk as i32, 0x11)
         };
 
-        if phys_addr == 0 {
-            // 页未映射，无法写入，终止
-            break;
-        }
+        if bytes_written <= 0 { break; }
 
-        let kva = phys_addr.wrapping_add(unsafe { crate::ffi::SYMS.linear_voffset });
-        let kva_slice = unsafe { core::slice::from_raw_parts_mut(kva as *mut u8, chunk) };
-        if let Err(_) = copy_from_user(kva_slice, cur_src as *const c_void) {
-            break;
-        }
-
-        total_written += chunk;
-        remaining -= chunk;
-        cur_vaddr += chunk as u64;
-        cur_src += chunk as u64;
-    }
-
-    unsafe {
-        if let Some(mmput_fn) = crate::sym!(mmput) {
-            mmput_fn(mm);
-        }
+        total_written += bytes_written as usize;
+        remaining -= bytes_written as usize;
+        cur_vaddr += bytes_written as u64;
+        cur_src += bytes_written as u64;
     }
 
     Ok(total_written)
