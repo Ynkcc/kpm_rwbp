@@ -250,6 +250,11 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
     let node_offset = core::mem::offset_of!(HwbpNode, unreg_work);
     let node = (work as usize - node_offset) as *mut HwbpNode;
 
+    // 等待所有并发 RCU 读者安全退出临界区
+    if let Some(sync_rcu) = crate::sym!(synchronize_rcu) {
+        sync_rcu();
+    }
+
     if (*node).scheme == 3 {
         if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
             on_each_cpu(disable_wp_regs_on_cpu, core::ptr::null_mut(), 1);
@@ -299,9 +304,9 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
     let regs = (*args).arg2 as *mut PtRegs;
     let mut found_node: *mut HwbpNode = core::ptr::null_mut();
 
-    let guard = BP_LIST_LOCK.lock();
+    // RCU 无锁读取：移除 BP_LIST_LOCK.lock()
     let bp_list_ptr = &raw mut BP_LIST;
-    let mut curr = unsafe { (*bp_list_ptr).next };
+    let mut curr = unsafe { (*bp_list_ptr).next_rcu() };
     while curr != bp_list_ptr {
         let node_offset = core::mem::offset_of!(HwbpNode, list);
         let node = (curr as usize - node_offset) as *mut HwbpNode;
@@ -312,7 +317,7 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
             } else {
                 0
             };
-            if unsafe { (*node).pid == pid && (*node).active.load(Ordering::SeqCst) } {
+            if unsafe { (*node).pid == pid && (*node).active.load(Ordering::Acquire) } {
                 let hw_addr = calc_hw_addr((*node).addr, (*node).bp_type, (*node).len);
                 if (addr & !7u64) == hw_addr {
                     if !(*node).is_temp_bp {
@@ -324,9 +329,8 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
                 }
             }
         }
-        curr = unsafe { (*curr).next };
+        curr = unsafe { (*curr).next_rcu() };
     }
-    drop(guard);
 
     if !found_node.is_null() {
         pr_info!(
@@ -377,19 +381,18 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
     pr_info!("hwbp_triggered 触发! bp={:p}", bp);
 
     let mut found_node: *mut HwbpNode = core::ptr::null_mut();
-    let guard = BP_LIST_LOCK.lock();
+    // RCU 无锁读取：同样移除全局自旋锁
     let bp_list_ptr = &raw mut BP_LIST;
-    let mut curr = unsafe { (*bp_list_ptr).next };
+    let mut curr = unsafe { (*bp_list_ptr).next_rcu() };
     while curr != bp_list_ptr {
         let node_offset = core::mem::offset_of!(HwbpNode, list);
         let node = (curr as usize - node_offset) as *mut HwbpNode;
-        if unsafe { (*node).bp == bp && (*node).active.load(Ordering::SeqCst) } {
+        if unsafe { (*node).bp == bp && (*node).active.load(Ordering::Acquire) } {
             found_node = node;
             break;
         }
-        curr = unsafe { (*curr).next };
+        curr = unsafe { (*curr).next_rcu() };
     }
-    drop(guard);
 
     if found_node.is_null() {
         pr_warn!("hwbp_triggered: 未找到对应的 HwbpNode，bp={:p}", bp);
@@ -608,7 +611,7 @@ pub fn register_hwbp(
 
             let guard = BP_LIST_LOCK.lock();
             let bp_list_ptr = &raw mut BP_LIST;
-            (*bp_list_ptr).add(&mut (*node_ptr).list);
+            (*bp_list_ptr).add_rcu(&mut (*node_ptr).list);
             drop(guard);
 
             if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
@@ -678,7 +681,7 @@ pub fn register_hwbp(
 
         let guard = BP_LIST_LOCK.lock();
         let bp_list_ptr = &raw mut BP_LIST;
-        (*bp_list_ptr).add(&mut (*node_ptr).list);
+        (*bp_list_ptr).add_rcu(&mut (*node_ptr).list);
         drop(guard);
 
         if let Some(enable_fn) = crate::sym!(perf_event_enable) {
@@ -702,8 +705,8 @@ pub fn unregister_hwbp(pid: u32, addr: u64) -> Result<(), i32> {
         let node = (curr as usize - node_offset) as *mut HwbpNode;
         if unsafe { (*node).pid == pid && (*node).addr == addr } {
             unsafe {
-                (*node).active.store(false, Ordering::SeqCst);
-                (*curr).del();
+                (*node).active.store(false, Ordering::Release);
+                (*curr).del_rcu();
             };
             target_node = node;
             break;
@@ -740,11 +743,9 @@ pub fn unregister_hwbp(pid: u32, addr: u64) -> Result<(), i32> {
 
 /// 注销所有的硬件断点
 pub fn unregister_all_hwbp() -> Result<(), i32> {
-    // 建立临时的链表头，用以接收全局链表脱离开来的节点
-    let mut temp_list = ListHead { next: core::ptr::null_mut(), prev: core::ptr::null_mut() };
-    temp_list.init();
+    let mut nodes_to_free = [core::ptr::null_mut::<HwbpNode>(); 64];
+    let mut count = 0;
 
-    // 在最小锁保护范围内摘除节点并挂入临时链表
     let guard = BP_LIST_LOCK.lock();
     unsafe {
         let bp_list_ptr = &raw mut BP_LIST;
@@ -753,22 +754,25 @@ pub fn unregister_all_hwbp() -> Result<(), i32> {
             let next = (*curr).next;
             let node_offset = core::mem::offset_of!(HwbpNode, list);
             let node = (curr as usize - node_offset) as *mut HwbpNode;
-            (*node).active.store(false, Ordering::SeqCst);
-            (*curr).del();
-            temp_list.add(curr);
+            (*node).active.store(false, Ordering::Release);
+            (*curr).del_rcu();
+            if count < 64 {
+                nodes_to_free[count] = node;
+                count += 1;
+            } else {
+                pr_err!("unregister_all_hwbp: 需要注销的断点节点数超过 64，发生丢弃！");
+            }
             curr = next;
         }
     }
     drop(guard);
 
-    // 此时已经完全释放了全局自旋锁，在没有任何锁的上下文中异步挂载注销工作项
     unsafe {
-        let mut curr = temp_list.next;
-        while curr != &raw mut temp_list {
-            let next = (*curr).next;
-            let node_offset = core::mem::offset_of!(HwbpNode, list);
-            let node = (curr as usize - node_offset) as *mut HwbpNode;
-
+        for i in 0..count {
+            let node = nodes_to_free[i];
+            if node.is_null() {
+                continue;
+            }
             IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
             (*node).unreg_work.init(unregister_bp_work_func);
             if let Some(queue_fn) = crate::sym!(queue_work_on) {
@@ -785,7 +789,6 @@ pub fn unregister_all_hwbp() -> Result<(), i32> {
                 IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
                 unregister_bp_work_func(&mut (*node).unreg_work);
             }
-            curr = next;
         }
     }
 
@@ -807,9 +810,8 @@ pub fn read_hwbp_info(
     let mut temp_records = [unsafe { core::mem::zeroed::<HwbpHitRecord>() }; 16];
     let mut count_to_copy = 0;
 
-    let guard = BP_LIST_LOCK.lock();
     let bp_list_ptr = &raw mut BP_LIST;
-    let mut curr = unsafe { (*bp_list_ptr).next };
+    let mut curr = unsafe { (*bp_list_ptr).next_rcu() };
     while curr != bp_list_ptr {
         let node_offset = core::mem::offset_of!(HwbpNode, list);
         let node = (curr as usize - node_offset) as *mut HwbpNode;
@@ -836,9 +838,8 @@ pub fn read_hwbp_info(
                 break;
             }
         }
-        curr = unsafe { (*curr).next };
+        curr = unsafe { (*curr).next_rcu() };
     }
-    drop(guard);
 
     // 锁已被全部安全释放，可以自由进行可能导致睡眠/缺页的拷贝
     use crate::mm::copy_to_user;

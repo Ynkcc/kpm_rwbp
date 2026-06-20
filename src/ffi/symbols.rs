@@ -252,6 +252,9 @@ pub struct KernelSymbols {
         wait: c_int,
     )>,
 
+    // RCU 同步
+    pub synchronize_rcu: Option<unsafe extern "C" fn()>,
+
     // 工作队列和页信息 - 直接存储类型（不使用 Option），通过 null/0 判断
     pub system_wq: *mut c_void,
     pub page_size: i64,
@@ -292,6 +295,7 @@ pub static mut SYMS: KernelSymbols = KernelSymbols {
     perf_event_disable_inatomic: None,
     perf_event_enable: None,
     on_each_cpu: None,
+    synchronize_rcu: None,
     system_wq: core::ptr::null_mut(),
     page_size: 0,
     page_shift: 0,
@@ -366,6 +370,10 @@ pub unsafe fn init_symbols() -> Result<(), i32> {
     (*syms_ptr).perf_event_disable_inatomic = lookup_sym("perf_event_disable_inatomic");
     (*syms_ptr).perf_event_enable = lookup_sym("perf_event_enable");
     (*syms_ptr).on_each_cpu = lookup_sym("on_each_cpu");
+    (*syms_ptr).synchronize_rcu = lookup_sym("synchronize_rcu");
+    if (*syms_ptr).synchronize_rcu.is_none() {
+        crate::pr_warn!("未找到 synchronize_rcu，降级为非阻塞释放可能有 UAF 风险！");
+    }
 
     let system_wq_sym: Option<*mut *mut c_void> = lookup_sym("system_wq");
     if let Some(sym) = system_wq_sym {
