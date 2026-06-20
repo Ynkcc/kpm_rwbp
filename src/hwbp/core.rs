@@ -9,10 +9,28 @@ use core::sync::atomic::{AtomicI32, AtomicU64, Ordering, AtomicBool};
 use zerocopy::{FromBytes, IntoBytes, Immutable, KnownLayout};
 
 // 全局状态变量
-pub static mut BP_LIST: ListHead = ListHead {
-    next: core::ptr::null_mut(),
-    prev: core::ptr::null_mut(),
-};
+pub struct RcuList {
+    head: core::cell::UnsafeCell<ListHead>,
+}
+
+unsafe impl Sync for RcuList {}
+
+impl RcuList {
+    pub const fn new() -> Self {
+        Self {
+            head: core::cell::UnsafeCell::new(ListHead {
+                next: core::ptr::null_mut(),
+                prev: core::ptr::null_mut(),
+            }),
+        }
+    }
+
+    pub fn get_ptr(&self) -> *mut ListHead {
+        self.head.get()
+    }
+}
+
+pub static BP_LIST: RcuList = RcuList::new();
 pub static BP_LIST_LOCK: RawSpinlock = RawSpinlock::new();
 pub static IN_FLIGHT: AtomicI32 = AtomicI32::new(0);
 
@@ -57,7 +75,7 @@ pub struct HwbpNode {
     pub hit_count: AtomicU64,
     pub unreg_work: WorkStruct,
     pub orig_attr: PerfEventAttr,
-    pub is_temp_bp: bool,
+    pub is_temp_bp: AtomicBool,
     pub recovery_work: WorkStruct,
     pub scheme: u32,
     pub next_instruction_attr: PerfEventAttr,
@@ -65,6 +83,8 @@ pub struct HwbpNode {
     pub hit_record_head: AtomicU64, // 写入游标 (单调递增)
     pub hit_record_tail: AtomicU64, // 读取游标 (单调递增)
     pub active: AtomicBool,
+    pub refcnt: AtomicI32,
+    pub record_lock: RawSpinlock,
 }
 
 /// 注册断点工作包装结构
@@ -77,6 +97,7 @@ pub struct RegisterWork {
     pub len: u32,
     pub scheme: u32,
 }
+
 
 // 寄存器辅助读写宏：用于访问 ARM64 硬件调试寄存器 (BVR/BCR, WVR/WCR)
 macro_rules! read_sysreg {
@@ -222,7 +243,7 @@ pub unsafe extern "C" fn recovery_bp_work_func(work: *mut WorkStruct) {
             enable_fn((*node).bp);
         }
     }
-    (*node).is_temp_bp = false;
+    (*node).is_temp_bp.store(false, Ordering::Release);
 }
 
 pub unsafe extern "C" fn write_wp_regs_on_cpu(info: *mut c_void) {
@@ -252,6 +273,17 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
     // 等待所有并发 RCU 读者安全退出临界区
     if let Some(sync_rcu) = crate::sym!(synchronize_rcu) {
         sync_rcu();
+    }
+
+    // 递减注册引用并在有读者并发使用时循环等待归零
+    if (*node).refcnt.fetch_sub(1, Ordering::Release) > 1 {
+        while (*node).refcnt.load(Ordering::Acquire) > 0 {
+            if let Some(msleep) = crate::sym!(msleep) {
+                msleep(1);
+            } else {
+                core::hint::spin_loop();
+            }
+        }
     }
 
     if (*node).scheme == 3 {
@@ -303,8 +335,10 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
     let regs = (*args).arg2 as *mut PtRegs;
     let mut found_node: *mut HwbpNode = core::ptr::null_mut();
 
-    // RCU 无锁读取：移除 BP_LIST_LOCK.lock()
-    let bp_list_ptr = &raw mut BP_LIST;
+    // RCU 锁保护
+    let _rcu_guard = crate::sync::RcuReadGuard::new();
+
+    let bp_list_ptr = BP_LIST.get_ptr();
     let mut curr = unsafe { (*bp_list_ptr).next_rcu() };
     while curr != bp_list_ptr {
         let node_offset = core::mem::offset_of!(HwbpNode, list);
@@ -319,9 +353,11 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
             if unsafe { (*node).pid == tgid && (*node).active.load(Ordering::Acquire) } {
                 let hw_addr = calc_hw_addr((*node).addr, (*node).bp_type, (*node).len);
                 if (addr & !7u64) == hw_addr {
-                    if !(*node).is_temp_bp {
+                    if !unsafe { (*node).is_temp_bp.load(Ordering::Acquire) } {
                         (*node).hit_count.fetch_add(1, Ordering::Relaxed);
-                        (*node).is_temp_bp = true;
+                        (*node).is_temp_bp.store(true, Ordering::Release);
+                        // 递增引用计数
+                        (*node).refcnt.fetch_add(1, Ordering::Relaxed);
                         found_node = node;
                     }
                     break;
@@ -339,34 +375,38 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
         );
 
         if !regs.is_null() {
+            // 局部自旋锁降级保护
+            let record_guard = (*found_node).record_lock.lock();
+
             // 原子抢占写入槽位
-            let head = unsafe { (*found_node).hit_record_head.fetch_add(1, Ordering::Acquire) };
+            let head = (*found_node).hit_record_head.fetch_add(1, Ordering::Acquire);
             let idx = (head % 16) as usize;
-            let rec = unsafe { &mut (*found_node).hit_records[idx] };
+            let rec = &mut (*found_node).hit_records[idx];
 
             // 将 hit_time 置零，作为该槽位正在被写入的“Busy”标志
-            unsafe { core::ptr::write_volatile(&mut rec.hit_time, 0); }
-            core::sync::atomic::compiler_fence(Ordering::Release);
+            core::ptr::write_volatile(&mut rec.hit_time, 0);
+            crate::sync::smp_wmb(); // 硬件内存屏障
 
             let task = get_current();
             if let Some(pid_fn) = crate::sym!(__task_pid_nr_ns) {
                 rec.task_id = pid_fn(task, 0, core::ptr::null_mut()) as u32;
             }
-            rec.hit_addr = unsafe { (*found_node).addr };
-            let regs_ref = unsafe { &*regs };
+            rec.hit_addr = (*found_node).addr;
+            let regs_ref = &*regs;
             rec.regs_info.pc = regs_ref.pc;
             rec.regs_info.sp = regs_ref.sp;
             rec.regs_info.pstate = regs_ref.pstate;
             rec.regs_info.regs.copy_from_slice(&regs_ref.regs[..31]);
 
-            // 内存屏障，确保所有寄存器数据落地
-            core::sync::atomic::compiler_fence(Ordering::Release);
+            crate::sync::smp_wmb(); // 硬件内存屏障
 
             // 最后填充真实时间，代表写入完成。强制兜底规避返回 0。
             if let Some(mono_ns_fn) = crate::sym!(ktime_get_mono_fast_ns) {
                 let t = mono_ns_fn();
-                unsafe { core::ptr::write_volatile(&mut rec.hit_time, if t == 0 { 1 } else { t }); }
+                core::ptr::write_volatile(&mut rec.hit_time, if t == 0 { 1 } else { t });
             }
+
+            drop(record_guard);
         }
 
         let ctrl = read_wcr(0);
@@ -375,6 +415,9 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
         if let Some(queue_fn) = crate::sym!(queue_work_on) {
             queue_fn(0, crate::sym!(system_wq), &mut (*found_node).recovery_work as *mut _ as *mut c_void);
         }
+
+        // 递减引用计数
+        (*found_node).refcnt.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -384,13 +427,18 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
     pr_info!("hwbp_triggered 触发! bp={:p}", bp);
 
     let mut found_node: *mut HwbpNode = core::ptr::null_mut();
-    // RCU 无锁读取：同样移除全局自旋锁
-    let bp_list_ptr = &raw mut BP_LIST;
+    
+    // RCU 锁保护
+    let _rcu_guard = crate::sync::RcuReadGuard::new();
+
+    let bp_list_ptr = BP_LIST.get_ptr();
     let mut curr = unsafe { (*bp_list_ptr).next_rcu() };
     while curr != bp_list_ptr {
         let node_offset = core::mem::offset_of!(HwbpNode, list);
         let node = (curr as usize - node_offset) as *mut HwbpNode;
         if unsafe { (*node).bp == bp && (*node).active.load(Ordering::Acquire) } {
+            // 找到节点，递增引用计数
+            (*node).refcnt.fetch_add(1, Ordering::Relaxed);
             found_node = node;
             break;
         }
@@ -402,13 +450,18 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
         return;
     }
 
-    if unsafe { (*found_node).scheme != 2 && (*found_node).is_temp_bp } {
+    if unsafe { (*found_node).scheme != 2 && (*found_node).is_temp_bp.load(Ordering::Acquire) } {
+        // 提前返回必须递减引用计数！
+        unsafe { (*found_node).refcnt.fetch_sub(1, Ordering::Release); }
         return;
     }
 
     unsafe { (*found_node).hit_count.fetch_add(1, Ordering::Relaxed) };
 
     if !pt_regs.is_null() {
+        // 局部自旋锁保护
+        let record_guard = unsafe { (*found_node).record_lock.lock() };
+
         // 原子抢占写入槽位
         let head = unsafe { (*found_node).hit_record_head.fetch_add(1, Ordering::Acquire) };
         let idx = (head % 16) as usize;
@@ -416,7 +469,7 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
 
         // 将 hit_time 置零，作为该槽位正在被写入的“Busy”标志
         unsafe { core::ptr::write_volatile(&mut rec.hit_time, 0); }
-        core::sync::atomic::compiler_fence(Ordering::Release);
+        crate::sync::smp_wmb(); // 硬件内存屏障
 
         let task = unsafe { get_current() };
         if let Some(pid_fn) = crate::sym!(__task_pid_nr_ns) {
@@ -429,35 +482,36 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
         rec.regs_info.pstate = pt_regs_ref.pstate;
         rec.regs_info.regs.copy_from_slice(&pt_regs_ref.regs[..31]);
 
-        // 内存屏障，确保所有寄存器数据落地
-        core::sync::atomic::compiler_fence(Ordering::Release);
+        crate::sync::smp_wmb(); // 硬件内存屏障
 
         // 最后填充真实时间，代表写入完成。强制兜底规避返回 0。
         if let Some(mono_ns_fn) = crate::sym!(ktime_get_mono_fast_ns) {
             let t = mono_ns_fn();
             unsafe { core::ptr::write_volatile(&mut rec.hit_time, if t == 0 { 1 } else { t }); }
         }
+
+        drop(record_guard);
     }
 
     pr_info!("=== 硬件断点命中 ===");
     pr_info!(
         "PID: {}, 地址: 0x{:x}, 命中次数: {}",
-        (*found_node).pid,
-        (*found_node).addr,
-        (*found_node).hit_count.load(Ordering::Relaxed)
+        unsafe { (*found_node).pid },
+        unsafe { (*found_node).addr },
+        unsafe { (*found_node).hit_count.load(Ordering::Relaxed) }
     );
-    pr_info!("PC 地址: 0x{:x}", if pt_regs.is_null() { 0 } else { (*pt_regs).pc });
+    pr_info!("PC 地址: 0x{:x}", if pt_regs.is_null() { 0 } else { unsafe { (*pt_regs).pc } });
 
     if let Some(dump_fn) = crate::sym!(dump_stack) {
         dump_fn();
     }
 
-    match (*found_node).scheme {
+    match unsafe { (*found_node).scheme } {
         1 | 4 => {
             if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
                 disable_fn(bp);
             }
-            (*found_node).is_temp_bp = true;
+            unsafe { (*found_node).is_temp_bp.store(true, Ordering::Release); }
             if let Some(queue_fn) = crate::sym!(queue_work_on) {
                 queue_fn(
                     0,
@@ -467,16 +521,16 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
             }
         }
         2 => {
-            if !(*found_node).is_temp_bp {
+            if !unsafe { (*found_node).is_temp_bp.load(Ordering::Acquire) } {
                 if !pt_regs.is_null()
                     && arm64_move_bp_to_next_instruction(
                         bp,
-                        (*pt_regs).pc + 4,
-                        &mut (*found_node).orig_attr,
-                        &mut (*found_node).next_instruction_attr,
+                        unsafe { (*pt_regs).pc } + 4,
+                        unsafe { &mut (*found_node).orig_attr },
+                        unsafe { &mut (*found_node).next_instruction_attr },
                     )
                 {
-                    (*found_node).is_temp_bp = true;
+                    unsafe { (*found_node).is_temp_bp.store(true, Ordering::Release); }
                 } else {
                     pr_err!("方案 2: 转移硬件断点到下一条指令失败！");
                     if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
@@ -486,10 +540,10 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
             } else {
                 if arm64_recovery_bp_to_original(
                     bp,
-                    &mut (*found_node).orig_attr,
-                    &mut (*found_node).next_instruction_attr,
+                    unsafe { &mut (*found_node).orig_attr },
+                    unsafe { &mut (*found_node).next_instruction_attr },
                 ) {
-                    (*found_node).is_temp_bp = false;
+                    unsafe { (*found_node).is_temp_bp.store(false, Ordering::Release); }
                 } else {
                     pr_err!("方案 2: 恢复原始硬件断点失败！");
                     if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
@@ -499,12 +553,15 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
             }
         }
         _ => {
-            toggle_bp_registers_directly((*found_node).addr, (*found_node).bp_type, (*found_node).len, false);
+            toggle_bp_registers_directly(unsafe { (*found_node).addr }, unsafe { (*found_node).bp_type }, unsafe { (*found_node).len }, false);
             if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
                 disable_fn(bp);
             }
         }
     }
+
+    // 结束执行前，递减引用计数
+    unsafe { (*found_node).refcnt.fetch_sub(1, Ordering::Release); }
 }
 
 unsafe fn arm64_move_bp_to_next_instruction(
@@ -566,7 +623,7 @@ pub fn register_hwbp(
 
     // 检查重复注册
     let guard = BP_LIST_LOCK.lock();
-    let bp_list_ptr = &raw mut BP_LIST;
+    let bp_list_ptr = BP_LIST.get_ptr();
     let mut curr = unsafe { (*bp_list_ptr).next };
     while curr != bp_list_ptr {
         let node_offset = core::mem::offset_of!(HwbpNode, list);
@@ -608,14 +665,17 @@ pub fn register_hwbp(
             (*node_ptr).len = len;
             (*node_ptr).scheme = 3;
             (*node_ptr).hit_count = AtomicU64::new(0);
-            (*node_ptr).is_temp_bp = false;
+            (*node_ptr).is_temp_bp = AtomicBool::new(false);
             (*node_ptr).hit_record_head = AtomicU64::new(0);
             (*node_ptr).hit_record_tail = AtomicU64::new(0);
             (*node_ptr).recovery_work.init(recovery_bp_work_func);
             (*node_ptr).active = AtomicBool::new(true);
+            (*node_ptr).refcnt = AtomicI32::new(1);
+            (*node_ptr).record_lock = RawSpinlock::new();
+            (*node_ptr).record_lock.init();
 
             let guard = BP_LIST_LOCK.lock();
-            let bp_list_ptr = &raw mut BP_LIST;
+            let bp_list_ptr = BP_LIST.get_ptr();
             (*bp_list_ptr).add_rcu(&mut (*node_ptr).list);
             drop(guard);
 
@@ -676,14 +736,17 @@ pub fn register_hwbp(
         (*node_ptr).scheme = scheme;
         (*node_ptr).hit_count = AtomicU64::new(0);
         (*node_ptr).orig_attr = attr;
-        (*node_ptr).is_temp_bp = false;
+        (*node_ptr).is_temp_bp = AtomicBool::new(false);
         (*node_ptr).hit_record_head = AtomicU64::new(0);
         (*node_ptr).hit_record_tail = AtomicU64::new(0);
         (*node_ptr).recovery_work.init(recovery_bp_work_func);
         (*node_ptr).active = AtomicBool::new(true);
+        (*node_ptr).refcnt = AtomicI32::new(1);
+        (*node_ptr).record_lock = RawSpinlock::new();
+        (*node_ptr).record_lock.init();
 
         let guard = BP_LIST_LOCK.lock();
-        let bp_list_ptr = &raw mut BP_LIST;
+        let bp_list_ptr = BP_LIST.get_ptr();
         (*bp_list_ptr).add_rcu(&mut (*node_ptr).list);
         drop(guard);
 
@@ -696,12 +759,12 @@ pub fn register_hwbp(
     Ok(())
 }
 
-/// 注销指定地址的进程硬件断点
+/// 注销指定地址 of 进程硬件断点
 pub fn unregister_hwbp(pid: u32, addr: u64) -> Result<(), i32> {
     let mut target_node: *mut HwbpNode = core::ptr::null_mut();
 
     let guard = BP_LIST_LOCK.lock();
-    let bp_list_ptr = &raw mut BP_LIST;
+    let bp_list_ptr = BP_LIST.get_ptr();
     let mut curr = unsafe { (*bp_list_ptr).next };
     while curr != bp_list_ptr {
         let node_offset = core::mem::offset_of!(HwbpNode, list);
@@ -750,7 +813,7 @@ pub fn unregister_all_hwbp() -> Result<(), i32> {
 
     let guard = BP_LIST_LOCK.lock();
     unsafe {
-        let bp_list_ptr = &raw mut BP_LIST;
+        let bp_list_ptr = BP_LIST.get_ptr();
         let mut curr = (*bp_list_ptr).next;
         while curr != bp_list_ptr {
             let next = (*curr).next;
@@ -811,14 +874,25 @@ pub fn read_hwbp_info(
     // 在内核栈上保留最多 16 个记录的临时缓冲
     let mut temp_records = [unsafe { core::mem::zeroed::<HwbpHitRecord>() }; 16];
     let mut count_to_copy = 0;
+    let mut found_node: *mut HwbpNode = core::ptr::null_mut();
 
-    let bp_list_ptr = &raw mut BP_LIST;
+    // 读者保护的 RcuReadGuard
+    let _rcu_guard = crate::sync::RcuReadGuard::new();
+
+    let bp_list_ptr = BP_LIST.get_ptr();
     let mut curr = unsafe { (*bp_list_ptr).next_rcu() };
     while curr != bp_list_ptr {
         let node_offset = core::mem::offset_of!(HwbpNode, list);
         let node = (curr as usize - node_offset) as *mut HwbpNode;
         unsafe {
             if (*node).pid == pid {
+                // 找到节点，递增引用计数
+                (*node).refcnt.fetch_add(1, Ordering::Relaxed);
+                found_node = node;
+
+                // 局部自旋锁降级保护
+                let record_guard = (*node).record_lock.lock();
+
                 let head = (*node).hit_record_head.load(Ordering::Acquire);
                 let mut tail = (*node).hit_record_tail.load(Ordering::Acquire);
 
@@ -836,10 +910,12 @@ pub fn read_hwbp_info(
                     let rec = &(*node).hit_records[idx];
 
                     // 遇到 hit_time 为 0 说明该槽位恰好处于异常处理上下文并发写入中，终止并留待下次读取
-                    if core::ptr::read_volatile(&rec.hit_time) == 0 {
+                    let hit_time = core::ptr::read_volatile(&rec.hit_time);
+                    if hit_time == 0 {
                         break; 
                     }
 
+                    crate::sync::smp_rmb(); // 硬件内存屏障
                     temp_records[i] = *rec;
                     tail += 1;
                     i += 1;
@@ -849,11 +925,25 @@ pub fn read_hwbp_info(
                 
                 // 将推进后的游标反馈回结构体，下一次 IPC 将从新起点拉取
                 (*node).hit_record_tail.store(tail, Ordering::Release);
+                drop(record_guard);
                 break;
             }
         }
+
         curr = unsafe { (*curr).next_rcu() };
     }
+
+    struct NodeGuard(*mut HwbpNode);
+    impl Drop for NodeGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    (*self.0).refcnt.fetch_sub(1, Ordering::Release);
+                }
+            }
+        }
+    }
+    let _guard = NodeGuard(found_node);
 
     // 锁已被全部安全释放，可以自由进行可能导致睡眠/缺页的拷贝
     use crate::mm::copy_to_user;

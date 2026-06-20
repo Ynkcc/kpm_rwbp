@@ -95,3 +95,44 @@ impl<'a, T> core::ops::DerefMut for KernelMutexGuard<'a, T> {
         self.data
     }
 }
+
+/// RCU 临界区安全守卫，离开作用域时自动解锁
+pub struct RcuReadGuard;
+
+impl RcuReadGuard {
+    pub fn new() -> Self {
+        unsafe {
+            if let Some(f) = crate::sym!(rcu_read_lock) {
+                f();
+            }
+        }
+        RcuReadGuard
+    }
+}
+
+impl Drop for RcuReadGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(f) = crate::sym!(rcu_read_unlock) {
+                f();
+            }
+        }
+    }
+}
+
+/// ARM64 物理写内存屏障 (dmb ishst)
+#[inline(always)]
+pub fn smp_wmb() {
+    unsafe {
+        core::arch::asm!("dmb ishst", options(nostack, preserves_flags, nomem));
+    }
+}
+
+/// ARM64 物理读内存屏障 (dmb ishld)
+#[inline(always)]
+pub fn smp_rmb() {
+    unsafe {
+        core::arch::asm!("dmb ishld", options(nostack, preserves_flags, nomem));
+    }
+}
+

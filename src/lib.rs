@@ -72,7 +72,7 @@ pub unsafe extern "C" fn rwbp_init(_args: *const u8, _event: *const u8, _reserve
     pr_info!("kpm_RWBP 模块初始化中...");
 
     // 初始化全局硬件断点管理链表，防止空指针解引用引发内核崩溃
-    let bp_list_ptr = &raw mut crate::hwbp::core::BP_LIST;
+    let bp_list_ptr = crate::hwbp::core::BP_LIST.get_ptr();
     (*bp_list_ptr).init();
 
     // 初始化内核符号
