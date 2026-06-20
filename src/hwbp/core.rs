@@ -234,7 +234,7 @@ pub unsafe extern "C" fn recovery_bp_work_func(work: *mut WorkStruct) {
     pr_info!("recovery_bp_work_func: 恢复断点 {:p}, 方案 {}", (*node).bp, (*node).scheme);
 
     if (*node).active.load(Ordering::Acquire) {
-        if (*node).scheme == 3 {
+        if (*node).scheme == 2 {
             if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
                 on_each_cpu(write_wp_regs_on_cpu, node as *mut c_void, 1);
             }
@@ -279,7 +279,12 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
     let node_offset = core::mem::offset_of!(HwbpNode, unreg_work);
     let node = (work as usize - node_offset) as *mut HwbpNode;
 
-    if (*node).scheme == 3 {
+    // 1. 同步取消可能正在在途/排队的恢复工作项，确保生命周期安全
+    if let Some(cancel_fn) = crate::sym!(cancel_work_sync) {
+        cancel_fn(&mut (*node).recovery_work as *mut _ as *mut c_void);
+    }
+
+    if (*node).scheme == 2 {
         let mut has_other_scheme3 = false;
         let guard = BP_LIST_LOCK.lock();
         let bp_list_ptr = BP_LIST.get_ptr();
@@ -287,7 +292,7 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
         while curr != bp_list_ptr {
             let node_offset = core::mem::offset_of!(HwbpNode, list);
             let other_node = (curr as usize - node_offset) as *mut HwbpNode;
-            if other_node != node && (*other_node).scheme == 3 && (*other_node).active.load(Ordering::Acquire) {
+            if other_node != node && (*other_node).scheme == 2 && (*other_node).active.load(Ordering::Acquire) {
                 has_other_scheme3 = true;
                 break;
             }
@@ -304,6 +309,11 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
         if let Some(unreg_fn) = crate::sym!(unregister_hw_breakpoint) {
             unreg_fn((*node).bp);
         }
+    }
+
+    // 2. 物理释放前调用 synchronize_rcu，确保所有核上当前的断点异常触发上下文彻底退出
+    if let Some(sync_rcu) = crate::sym!(synchronize_rcu) {
+        sync_rcu();
     }
 
     // 递减注册占用引用。如果是最后一个扣减引用的，则物理释放资源。
@@ -347,6 +357,7 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
     let addr = (*args).arg0;
     let regs = (*args).arg2 as *mut PtRegs;
     let mut found_node: *mut HwbpNode = core::ptr::null_mut();
+    let mut is_matched = false;
 
     // RCU 锁保护
     let _rcu_guard = crate::sync::RcuReadGuard::new();
@@ -356,7 +367,7 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
     while curr != bp_list_ptr {
         let node_offset = core::mem::offset_of!(HwbpNode, list);
         let node = (curr as usize - node_offset) as *mut HwbpNode;
-        if unsafe { (*node).scheme == 3 } {
+        if unsafe { (*node).scheme == 2 } {
             let task = get_current();
             let tgid = if let Some(pid_fn) = crate::sym!(__task_pid_nr_ns) {
                 pid_fn(task, 1, core::ptr::null_mut()) as u32
@@ -366,9 +377,15 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
             if unsafe { (*node).pid == tgid && (*node).active.load(Ordering::Acquire) } {
                 let hw_addr = calc_hw_addr((*node).addr, (*node).bp_type, (*node).len);
                 if (addr & !7u64) == hw_addr {
-                    if !unsafe { (*node).is_temp_bp.load(Ordering::Acquire) } {
+                    is_matched = true;
+                    // 使用 compare_exchange 确保并发安全，防止多核同时增加 refcnt 导致泄露
+                    if unsafe {
+                        (*node)
+                            .is_temp_bp
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                    } {
                         (*node).hit_count.fetch_add(1, Ordering::Relaxed);
-                        (*node).is_temp_bp.store(true, Ordering::Release);
                         // 递增引用计数
                         (*node).refcnt.fetch_add(1, Ordering::Relaxed);
                         found_node = node;
@@ -378,6 +395,12 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
             }
         }
         curr = unsafe { (*curr).next_rcu() };
+    }
+
+    // 只要地址匹配，无条件在当前 CPU 上关闭 Watchpoint 寄存器使能，防止多核死循环卡死
+    if is_matched {
+        let ctrl = read_wcr(0);
+        write_wcr(0, ctrl & !1u64);
     }
 
     if !found_node.is_null() {
@@ -416,9 +439,6 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
                 core::ptr::write_volatile(&mut rec.hit_time, if t == 0 { 1 } else { t });
             }
         }
-
-        let ctrl = read_wcr(0);
-        write_wcr(0, ctrl & !1u64);
 
         let mut ref_transferred = false;
         if let Some(queue_fn) = crate::sym!(queue_work_on) {
@@ -469,7 +489,7 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
         return;
     }
 
-    if unsafe { (*found_node).scheme != 2 && (*found_node).is_temp_bp.load(Ordering::Acquire) } {
+    if unsafe { (*found_node).scheme == 1 && (*found_node).is_temp_bp.load(Ordering::Acquire) } {
         // 提前返回必须递减引用计数！
         unsafe { (*found_node).refcnt.fetch_sub(1, Ordering::Release); }
         return;
@@ -522,7 +542,7 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
 
     let mut ref_transferred = false;
     match unsafe { (*found_node).scheme } {
-        1 | 4 => {
+        1 => {
             if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
                 disable_fn(bp);
             }
@@ -538,35 +558,23 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
                 }
             }
         }
-        2 => {
-            if !unsafe { (*found_node).is_temp_bp.load(Ordering::Acquire) } {
-                if !pt_regs.is_null()
-                    && arm64_move_bp_to_next_instruction(
-                        bp,
-                        unsafe { (*pt_regs).pc } + 4,
-                        unsafe { &mut (*found_node).orig_attr },
-                        unsafe { &mut (*found_node).next_instruction_attr },
-                    )
-                {
-                    unsafe { (*found_node).is_temp_bp.store(true, Ordering::Release); }
-                } else {
-                    pr_err!("方案 2: 转移硬件断点到下一条指令失败！");
-                    if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
-                        disable_fn(bp);
-                    }
-                }
-            } else {
-                if arm64_recovery_bp_to_original(
-                    bp,
-                    unsafe { &mut (*found_node).orig_attr },
-                    unsafe { &mut (*found_node).next_instruction_attr },
-                ) {
-                    unsafe { (*found_node).is_temp_bp.store(false, Ordering::Release); }
-                } else {
-                    pr_err!("方案 2: 恢复原始硬件断点失败！");
-                    if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
-                        disable_fn(bp);
-                    }
+        999 => {
+            // TODO: 计划将来重构为真正的硬件单步单核跳过
+            // 现因 modify_user_hw_breakpoint 在 atomic 中断上下文中获取 Mutex 导致 "scheduling while atomic" 崩溃，
+            // 故当前废弃此方案的实际动作。退化为类似于 Scheme 1 的 perf_event 临时禁用，留待未来安全重构。
+            pr_warn!("Scheme 999 触发。当前方案已安全降级为工作队列延时恢复，防止 atomic 上下文睡眠。");
+            if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
+                disable_fn(bp);
+            }
+            unsafe { (*found_node).is_temp_bp.store(true, Ordering::Release); }
+            if let Some(queue_fn) = crate::sym!(queue_work_on) {
+                let ret = queue_fn(
+                    0,
+                    crate::sym!(system_wq),
+                    &mut (*found_node).recovery_work as *mut _ as *mut c_void,
+                );
+                if ret != 0 {
+                    ref_transferred = true;
                 }
             }
         }
@@ -591,6 +599,7 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
     }
 }
 
+#[allow(dead_code)]
 unsafe fn arm64_move_bp_to_next_instruction(
     bp: *mut c_void,
     next_instruction_addr: u64,
@@ -620,6 +629,7 @@ unsafe fn arm64_move_bp_to_next_instruction(
     false
 }
 
+#[allow(dead_code)]
 unsafe fn arm64_recovery_bp_to_original(
     bp: *mut c_void,
     original_attr: &mut PerfEventAttr,
@@ -664,17 +674,22 @@ pub fn register_hwbp(
     }
     drop(guard);
 
-    if scheme == 3 {
+    if scheme == 999 {
+        pr_err!("register_hwbp: 方案 999 已被废弃，直接返回错误");
+        return Err(-22); // EINVAL
+    }
+    if scheme != 1 && scheme != 2 {
+        pr_err!("register_hwbp: 不支持的方案 {}，仅支持方案 1 和 2", scheme);
+        return Err(-22); // EINVAL
+    }
+
+    if scheme == 2 {
         unsafe {
-            // 延迟加载 watchpoint hook （注意：该功能重构后将由 hooks 模块具体执行注册，我们直接通过 extern 动态加载）
-            // 在此我们需要确保 hooks 里的 watchpoint hook 能够正常注册
+            // 延迟加载 watchpoint hook
             let install_fn: Option<unsafe extern "C" fn()> = crate::ffi::lookup_sym("watchpoint_handler_install_hook_helper"); 
             if let Some(install) = install_fn {
                 install();
             } else {
-                // 如果没有辅助全局函数，通过 watchpoint_handler 导入
-                // 由于重构为 hooks/watchpoint.rs，我们只需在 hooks/watchpoint.rs 导出相应公开绑定
-                // 或直接在此内部调用 hooks::watchpoint::install_wp_hook()
                 crate::hooks::watchpoint::install_wp_hook(before_watchpoint_handler as *const c_void);
             }
 
@@ -690,7 +705,7 @@ pub fn register_hwbp(
             (*node_ptr).addr = addr;
             (*node_ptr).bp_type = bp_type;
             (*node_ptr).len = len;
-            (*node_ptr).scheme = 3;
+            (*node_ptr).scheme = 2; // 原 Scheme 3 改为 Scheme 2
             (*node_ptr).hit_count = AtomicU64::new(0);
             (*node_ptr).is_temp_bp = AtomicBool::new(false);
             (*node_ptr).hit_record_head = AtomicU64::new(0);
@@ -707,7 +722,7 @@ pub fn register_hwbp(
             if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
                 on_each_cpu(write_wp_regs_on_cpu, node_ptr as *mut c_void, 1);
             }
-            pr_info!("register_hwbp 方案 3: 初始化启用成功");
+            pr_info!("register_hwbp 方案 2: 初始化启用成功");
         }
         return Ok(());
     }
@@ -894,8 +909,30 @@ pub fn read_hwbp_info(
         return Err(-22); // EINVAL
     }
 
-    // 在内核栈上保留最多 16 个记录的临时缓冲
-    let mut temp_records = [unsafe { core::mem::zeroed::<HwbpHitRecord>() }; 16];
+    // 动态分配 16 个记录的堆空间，消除内核栈溢出隐患（约 4.6KB）
+    let malloc_fn = crate::sym!(__kmalloc).ok_or(-38)?;
+    let temp_records_ptr = unsafe {
+        malloc_fn(
+            16 * core::mem::size_of::<HwbpHitRecord>(),
+            0x20u32, // GFP_ATOMIC
+        )
+    } as *mut HwbpHitRecord;
+    if temp_records_ptr.is_null() {
+        return Err(-12); // ENOMEM
+    }
+
+    struct TempRecordsGuard(*mut HwbpHitRecord);
+    impl Drop for TempRecordsGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                if let Some(free_fn) = crate::sym!(kfree) {
+                    unsafe { free_fn(self.0 as *const c_void); }
+                }
+            }
+        }
+    }
+    let _records_guard = TempRecordsGuard(temp_records_ptr);
+
     let mut count_to_copy = 0;
     let mut found_node: *mut HwbpNode = core::ptr::null_mut();
 
@@ -936,7 +973,7 @@ pub fn read_hwbp_info(
                     }
 
                     crate::sync::smp_rmb(); // 硬件内存屏障
-                    temp_records[i] = *rec;
+                    core::ptr::write(temp_records_ptr.add(i), *rec);
                     tail += 1;
                     i += 1;
                 }
@@ -969,22 +1006,23 @@ pub fn read_hwbp_info(
     }
     let _guard = NodeGuard(found_node);
 
-    // 锁已被全部安全释放，可以自由进行可能导致睡眠/缺页的拷贝
+    // 锁已被全部安全释放，可以自由进行可能导致睡眠/缺页 of 拷贝
     use crate::mm::copy_to_user;
     use zerocopy::IntoBytes;
     for i in 0..count_to_copy {
         let dst = (user_buf as usize
             + i * core::mem::size_of::<HwbpHitRecord>()) as *mut c_void;
+        let record_ref = unsafe { &*temp_records_ptr.add(i) };
         if (dst as usize) >= 0xffff000000000000usize {
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    temp_records[i].as_bytes().as_ptr(),
+                    record_ref.as_bytes().as_ptr(),
                     dst as *mut u8,
                     core::mem::size_of::<HwbpHitRecord>(),
                 );
             }
         } else {
-            let copy_res = copy_to_user(dst, temp_records[i].as_bytes());
+            let copy_res = copy_to_user(dst, record_ref.as_bytes());
             if copy_res.is_err() {
                 return Err(-14); // EFAULT
             }

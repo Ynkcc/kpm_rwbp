@@ -11,8 +11,24 @@ pub extern "C" fn rust_eh_personality() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn memcmp(_a: *const u8, _b: *const u8, _n: usize) -> i32 {
-    // 内核会提供实际实现，这里只是占位符
     0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    if dest.is_null() || src.is_null() || n == 0 {
+        return dest;
+    }
+    if (dest as usize) < (src as usize) {
+        for i in 0..n {
+            core::ptr::write_volatile(dest.add(i), core::ptr::read_volatile(src.add(i)));
+        }
+    } else if (dest as usize) > (src as usize) {
+        for i in (0..n).rev() {
+            core::ptr::write_volatile(dest.add(i), core::ptr::read_volatile(src.add(i)));
+        }
+    }
+    dest
 }
 
 #[macro_use]
@@ -121,16 +137,18 @@ pub unsafe extern "C" fn rwbp_exit(_reserved: *mut c_void) -> i64 {
         crate::hooks::syscall::rwbp_exit_group_hook as *const c_void,
         core::ptr::null(),
     );
+    crate::hooks::watchpoint::remove_wp_hook();
 
+    // 先注销和排队清理任务，触发 IN_FLIGHT 的递增和排队
+    crate::hooks::syscall::handle_cleanup();
+
+    // 再循环等待所有在途的任务完全退空
     while crate::hwbp::core::IN_FLIGHT.load(Ordering::SeqCst) > 0 {
         pr_info!("模块注销等待中... 在途工作任务数: {}", crate::hwbp::core::IN_FLIGHT.load(Ordering::SeqCst));
         if let Some(msleep_fn) = sym!(msleep) {
             msleep_fn(10);
         }
     }
-
-    crate::hooks::syscall::handle_cleanup();
-    crate::hooks::watchpoint::remove_wp_hook();
 
     pr_info!("模块已安全卸载...");
     0

@@ -20,7 +20,7 @@ rust_build:
 $(out_dir)/kpm_RWBP.kpm: rust_build
 	mkdir -p $(out_dir)
 	printf 'SECTIONS { .text : { *(.text .text.* .gnu.linkonce.t.*) } .rodata : { *(.rodata .rodata.* .gnu.linkonce.r.*) } .data : { *(.data .data.* .gnu.linkonce.d.*) } .bss : { *(.bss .bss.* .gnu.linkonce.b.*) } .kpm.info : { *(.kpm.info) } .kpm.init : { *(.kpm.init) } .kpm.exit : { *(.kpm.exit) } }\n' > /tmp/kpm_merge.ld
-	$(LD_LLD) -r -T /tmp/kpm_merge.ld -o $@ --undefined __kpm_info_name --undefined __kpm_info_version --undefined __kpm_info_license --undefined __kpm_info_author --undefined __kpm_info_description --undefined __kpm_initcall_rwbp_init --undefined __kpm_exitcall_rwbp_exit --undefined memset --undefined memcpy --undefined memcmp --undefined rust_eh_personality $(RUST_LIB)
+	$(LD_LLD) -r -T /tmp/kpm_merge.ld -o $@ --undefined __kpm_info_name --undefined __kpm_info_version --undefined __kpm_info_license --undefined __kpm_info_author --undefined __kpm_info_description --undefined __kpm_initcall_rwbp_init --undefined __kpm_exitcall_rwbp_exit --undefined memset --undefined memcpy --undefined memcmp --undefined memmove --undefined rust_eh_personality $(RUST_LIB)
 	$(STRIP) --remove-section=.eh_frame --strip-debug $@
 
 clean:

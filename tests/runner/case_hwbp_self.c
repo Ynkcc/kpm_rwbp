@@ -438,7 +438,7 @@ static bool _run_scheme(int anon_fd, int scheme, int timeout_ms)
 int run_case_hwbp_self(int anon_fd, int scheme, hwbp_scheme_result_t *results, int timeout_ms)
 {
     int start = (scheme == 0) ? 1 : scheme;
-    int end   = (scheme == 0) ? 4 : scheme;
+    int end   = (scheme == 0) ? 2 : scheme;
     int pass_count = 0;
     int idx = 0;
 

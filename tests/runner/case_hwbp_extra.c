@@ -27,7 +27,7 @@ bool run_case_hwbp_scale(int anon_fd)
         bcmd.addr = base_addr + i * 8;
         bcmd.type = 3;    // rw
         bcmd.len = 8;
-        bcmd.scheme = 3;  // Scheme 3 不需要硬件寄存器插槽限制，可无限注册
+        bcmd.scheme = 2;  // Scheme 2 不需要硬件寄存器插槽限制，可无限注册
 
         long ret = kpm_ipc_cmd(anon_fd, OP_SET_HW_BREAKPOINT, &bcmd);
         if (ret != 0) {
@@ -67,7 +67,7 @@ bool run_case_hwbp_scale(int anon_fd)
     test_cmd.addr = base_addr;
     test_cmd.type = 3;
     test_cmd.len = 8;
-    test_cmd.scheme = 3;
+    test_cmd.scheme = 2;
 
     long test_ret = kpm_ipc_cmd(anon_fd, OP_SET_HW_BREAKPOINT, &test_cmd);
     if (test_ret == 0) {
@@ -158,7 +158,7 @@ bool run_case_hwbp_concurrency(int anon_fd)
     bcmd.addr = (uint64_t)&shared_bp_val;
     bcmd.type = 3; // rw
     bcmd.len = 8;
-    bcmd.scheme = 3;
+    bcmd.scheme = 2;
 
     long ret = kpm_ipc_cmd(anon_fd, OP_SET_HW_BREAKPOINT, &bcmd);
     if (ret != 0) {

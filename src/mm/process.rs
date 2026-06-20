@@ -309,6 +309,10 @@ pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64)
         remaining -= chunk;
         cur_vaddr += chunk as u64;
         cur_outbuf += chunk as u64;
+
+        if let Some(resched) = crate::sym!(cond_resched) {
+            unsafe { resched(); }
+        }
     }
 
     unsafe {
@@ -335,18 +339,36 @@ pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64)
     let mut cur_src = src_user_addr;
     let mut total_written = 0;
     
-    let mut kbuf = [0u8; 1024];
+    // 动态分配 16KB 堆拷贝缓冲区，消除栈溢出风险，并降低 access_process_vm 调用频次成倍提升写入吞吐量
+    let malloc_fn = crate::sym!(__kmalloc).ok_or(-38)?;
+    let kbuf_ptr = unsafe { malloc_fn(16384, 0x20u32) } as *mut u8; // GFP_ATOMIC
+    if kbuf_ptr.is_null() {
+        return Err(-12); // ENOMEM
+    }
+
+    struct KbufGuard(*mut u8);
+    impl Drop for KbufGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                if let Some(free_fn) = crate::sym!(kfree) {
+                    unsafe { free_fn(self.0 as *const c_void); }
+                }
+            }
+        }
+    }
+    let _guard = KbufGuard(kbuf_ptr);
 
     while remaining > 0 {
-        let chunk = core::cmp::min(remaining, kbuf.len());
+        let chunk = core::cmp::min(remaining, 16384);
+        let kbuf_slice = unsafe { core::slice::from_raw_parts_mut(kbuf_ptr, chunk) };
         
-        if let Err(_) = copy_from_user(&mut kbuf[..chunk], cur_src as *const c_void) {
+        if let Err(_) = copy_from_user(kbuf_slice, cur_src as *const c_void) {
             break;
         }
 
         // FOLL_WRITE(0x1) | FOLL_FORCE(0x10) = 0x11
         let bytes_written = unsafe {
-            access_fn(task, cur_vaddr, kbuf.as_mut_ptr() as *mut c_void, chunk as i32, 0x11)
+            access_fn(task, cur_vaddr, kbuf_ptr as *mut c_void, chunk as i32, 0x11)
         };
 
         if bytes_written <= 0 { break; }
@@ -355,6 +377,10 @@ pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64)
         remaining -= bytes_written as usize;
         cur_vaddr += bytes_written as u64;
         cur_src += bytes_written as u64;
+
+        if let Some(resched) = crate::sym!(cond_resched) {
+            unsafe { resched(); }
+        }
     }
 
     Ok(total_written)

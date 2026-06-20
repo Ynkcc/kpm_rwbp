@@ -24,7 +24,7 @@ static void print_usage(const char *prog)
 {
     printf("用法: %s [OPTIONS]\n", prog);
     printf("  --case <name>     all | mem | mem-write | mem-list | mem-array | hwbp-self | hwbp-target | hwbp-scale | hwbp-concurrency  (默认: all)\n");
-    printf("  --scheme <n>      HWBP 方案 1-4，0=全部运行  (默认: 0)\n");
+    printf("  --scheme <n>      HWBP 方案 1-2，0=全部运行  (默认: 0)\n");
     printf("  --timeout <ms>    单个断点方案超时时间 ms  (默认: 3000)\n");
     printf("  --help\n");
 }
@@ -158,7 +158,7 @@ int main(int argc, char *argv[])
 
         // 将每个方案作为独立条目加入汇总
         int start = (scheme == 0) ? 1 : scheme;
-        int end   = (scheme == 0) ? 4 : scheme;
+        int end   = (scheme == 0) ? 2 : scheme;
         for (int s = start, i = 0; s <= end; s++, i++) {
             char *name = malloc(32);
             snprintf(name, 32, "hwbp_self (方案 %d)", scheme_results[i].scheme);

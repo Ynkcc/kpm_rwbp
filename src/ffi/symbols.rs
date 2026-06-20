@@ -203,6 +203,7 @@ pub struct KernelSymbols {
 
     // 工作队列
     pub queue_work_on: Option<unsafe extern "C" fn(cpu: c_int, wq: *mut c_void, work: *mut c_void) -> c_int>,
+    pub cancel_work_sync: Option<unsafe extern "C" fn(work: *mut c_void) -> c_int>,
 
     // 物理内存
     pub pfn_valid: Option<unsafe extern "C" fn(pfn: u64) -> c_int>,
@@ -232,6 +233,7 @@ pub struct KernelSymbols {
         len: c_int,
         gup_flags: u32,
     ) -> c_int>,
+    pub cond_resched: Option<unsafe extern "C" fn() -> c_int>,
 
     // HwBP
     pub register_user_hw_breakpoint: Option<unsafe extern "C" fn(
@@ -278,6 +280,7 @@ pub static mut SYMS: KernelSymbols = KernelSymbols {
     find_task_by_vpid: None,
     __task_pid_nr_ns: None,
     queue_work_on: None,
+    cancel_work_sync: None,
     pfn_valid: None,
     valid_phys_addr_range: None,
     _raw_spin_lock_irqsave: None,
@@ -291,6 +294,7 @@ pub static mut SYMS: KernelSymbols = KernelSymbols {
     sprint_symbol: None,
     dump_stack: None,
     access_process_vm: None,
+    cond_resched: None,
     register_user_hw_breakpoint: None,
     unregister_hw_breakpoint: None,
     modify_user_hw_breakpoint: None,
@@ -361,6 +365,8 @@ pub unsafe fn init_symbols() -> Result<(), i32> {
     (*syms_ptr).ktime_get_real_seconds = lookup_sym("ktime_get_real_seconds");
     (*syms_ptr).ktime_get_mono_fast_ns = lookup_sym("ktime_get_mono_fast_ns");
     (*syms_ptr).queue_work_on = lookup_sym("queue_work_on");
+    (*syms_ptr).cancel_work_sync = lookup_sym("cancel_work_sync");
+    (*syms_ptr).cond_resched = lookup_sym("cond_resched");
     (*syms_ptr).pfn_valid = lookup_sym("pfn_valid");
     (*syms_ptr).valid_phys_addr_range = lookup_sym("valid_phys_addr_range");
     (*syms_ptr).copy_from_user_nofault = lookup_sym("copy_from_user_nofault");
