@@ -5,7 +5,7 @@ use crate::sync::RawSpinlock;
 use crate::utils::ListHead;
 use core::ffi::c_void;
 use core::ffi::c_int;
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering, AtomicBool};
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering, AtomicBool, AtomicU32};
 use zerocopy::{FromBytes, IntoBytes, Immutable, KnownLayout};
 
 // 全局状态变量
@@ -80,6 +80,7 @@ pub struct HwbpNode {
     pub scheme: u32,
     pub next_instruction_attr: PerfEventAttr,
     pub hit_records: [HwbpHitRecord; 16],
+    pub hit_record_seqs: [AtomicU32; 16],
     pub hit_record_head: AtomicU64, // 写入游标 (单调递增)
     pub hit_record_tail: AtomicU64, // 读取游标 (单调递增)
     pub active: AtomicBool,
@@ -281,7 +282,10 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
 
     // 1. 同步取消可能正在在途/排队的恢复工作项，确保生命周期安全
     if let Some(cancel_fn) = crate::sym!(cancel_work_sync) {
-        cancel_fn(&mut (*node).recovery_work as *mut _ as *mut c_void);
+        let cancelled = cancel_fn(&mut (*node).recovery_work as *mut _ as *mut c_void);
+        if cancelled != 0 {
+            (*node).refcnt.fetch_sub(1, Ordering::Release);
+        }
     }
 
     if (*node).scheme == 2 {
@@ -415,10 +419,12 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
             let head = (*found_node).hit_record_head.fetch_add(1, Ordering::Acquire);
             let idx = (head % 16) as usize;
             let rec = &mut (*found_node).hit_records[idx];
+            let seq_atom = &(*found_node).hit_record_seqs[idx];
 
-            // 将 hit_time 置零，作为该槽位正在被写入的“Busy”标志
-            core::ptr::write_volatile(&mut rec.hit_time, 0);
-            crate::sync::smp_wmb(); // 硬件内存屏障
+            // 1. SeqLock: 增加序列号（变为奇数，表示写入中）
+            let seq = seq_atom.load(Ordering::Relaxed).wrapping_add(1);
+            seq_atom.store(seq, Ordering::Release);
+            crate::sync::smp_wmb(); // 屏障以确保 seq 改变在写入数据前可见
 
             let task = get_current();
             if let Some(pid_fn) = crate::sym!(__task_pid_nr_ns) {
@@ -431,13 +437,18 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
             rec.regs_info.pstate = regs_ref.pstate;
             rec.regs_info.regs.copy_from_slice(&regs_ref.regs[..31]);
 
-            crate::sync::smp_wmb(); // 硬件内存屏障
-
-            // 最后填充真实时间，代表写入完成。强制兜底规避返回 0。
+            // 最后写入命中时间
             if let Some(mono_ns_fn) = crate::sym!(ktime_get_mono_fast_ns) {
                 let t = mono_ns_fn();
-                core::ptr::write_volatile(&mut rec.hit_time, if t == 0 { 1 } else { t });
+                rec.hit_time = if t == 0 { 1 } else { t };
+            } else {
+                rec.hit_time = 1; // 兜底
             }
+
+            crate::sync::smp_wmb(); // 屏障以确保数据写入完毕后才更新 seq
+
+            // 2. SeqLock: 增加序列号（变为偶数，表示写入完成）
+            seq_atom.store(seq.wrapping_add(1), Ordering::Release);
         }
 
         let mut ref_transferred = false;
@@ -502,10 +513,12 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
         let head = unsafe { (*found_node).hit_record_head.fetch_add(1, Ordering::Acquire) };
         let idx = (head % 16) as usize;
         let rec = unsafe { &mut (*found_node).hit_records[idx] };
+        let seq_atom = unsafe { &(*found_node).hit_record_seqs[idx] };
 
-        // 将 hit_time 置零，作为该槽位正在被写入的“Busy”标志
-        unsafe { core::ptr::write_volatile(&mut rec.hit_time, 0); }
-        crate::sync::smp_wmb(); // 硬件内存屏障
+        // 1. SeqLock: 增加序列号（变为奇数，表示写入中）
+        let seq = seq_atom.load(Ordering::Relaxed).wrapping_add(1);
+        seq_atom.store(seq, Ordering::Release);
+        crate::sync::smp_wmb(); // 屏障以确保 seq 改变在写入数据前可见
 
         let task = unsafe { get_current() };
         if let Some(pid_fn) = crate::sym!(__task_pid_nr_ns) {
@@ -518,13 +531,18 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
         rec.regs_info.pstate = pt_regs_ref.pstate;
         rec.regs_info.regs.copy_from_slice(&pt_regs_ref.regs[..31]);
 
-        crate::sync::smp_wmb(); // 硬件内存屏障
-
-        // 最后填充真实时间，代表写入完成。强制兜底规避返回 0。
+        // 最后写入命中时间
         if let Some(mono_ns_fn) = crate::sym!(ktime_get_mono_fast_ns) {
             let t = mono_ns_fn();
-            unsafe { core::ptr::write_volatile(&mut rec.hit_time, if t == 0 { 1 } else { t }); }
+            rec.hit_time = if t == 0 { 1 } else { t };
+        } else {
+            rec.hit_time = 1; // 兜底
         }
+
+        crate::sync::smp_wmb(); // 屏障以确保数据写入完毕后才更新 seq
+
+        // 2. SeqLock: 增加序列号（变为偶数，表示写入完成）
+        seq_atom.store(seq.wrapping_add(1), Ordering::Release);
     }
 
     pr_info!("=== 硬件断点命中 ===");
@@ -536,6 +554,7 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
     );
     pr_info!("PC 地址: 0x{:x}", if pt_regs.is_null() { 0 } else { unsafe { (*pt_regs).pc } });
 
+    #[cfg(feature = "dump_stack")]
     if let Some(dump_fn) = crate::sym!(dump_stack) {
         dump_fn();
     }
@@ -710,6 +729,9 @@ pub fn register_hwbp(
             (*node_ptr).is_temp_bp = AtomicBool::new(false);
             (*node_ptr).hit_record_head = AtomicU64::new(0);
             (*node_ptr).hit_record_tail = AtomicU64::new(0);
+            for idx in 0..16 {
+                core::ptr::write(&mut (*node_ptr).hit_record_seqs[idx], AtomicU32::new(0));
+            }
             (*node_ptr).recovery_work.init(recovery_bp_work_func);
             (*node_ptr).active = AtomicBool::new(true);
             (*node_ptr).refcnt = AtomicI32::new(1);
@@ -779,6 +801,9 @@ pub fn register_hwbp(
         (*node_ptr).is_temp_bp = AtomicBool::new(false);
         (*node_ptr).hit_record_head = AtomicU64::new(0);
         (*node_ptr).hit_record_tail = AtomicU64::new(0);
+        for idx in 0..16 {
+            core::ptr::write(&mut (*node_ptr).hit_record_seqs[idx], AtomicU32::new(0));
+        }
         (*node_ptr).recovery_work.init(recovery_bp_work_func);
         (*node_ptr).active = AtomicBool::new(true);
         (*node_ptr).refcnt = AtomicI32::new(1);
@@ -965,15 +990,50 @@ pub fn read_hwbp_info(
                 while i < limit {
                     let idx = (tail % 16) as usize;
                     let rec = &(*node).hit_records[idx];
+                    let seq_atom = &(*node).hit_record_seqs[idx];
 
-                    // 遇到 hit_time 为 0 说明该槽位恰好处于异常处理上下文并发写入中，终止并留待下次读取
-                    let hit_time = core::ptr::read_volatile(&rec.hit_time);
-                    if hit_time == 0 {
-                        break; 
+                    let mut success = false;
+                    let mut rec_val = HwbpHitRecord {
+                        hit_time: 0,
+                        task_id: 0,
+                        _pad: 0,
+                        hit_addr: 0,
+                        regs_info: crate::ipc::protocol::HwbpRegsSnapshot {
+                            regs: [0; 31],
+                            sp: 0,
+                            pc: 0,
+                            pstate: 0,
+                        },
+                    };
+
+                    // 尝试读取，若发生冲突则重试最多 3 次
+                    for _ in 0..3 {
+                        let seq1 = seq_atom.load(Ordering::Acquire);
+                        if seq1 % 2 != 0 {
+                            // 奇数表示正在写入，重试
+                            continue;
+                        }
+                        // 读取记录
+                        rec_val = core::ptr::read_volatile(rec as *const HwbpHitRecord);
+                        crate::sync::smp_rmb(); // 确保读数据完成后才二次检查序列号
+                        let seq2 = seq_atom.load(Ordering::Acquire);
+                        if seq1 == seq2 {
+                            success = true;
+                            break;
+                        }
                     }
 
-                    crate::sync::smp_rmb(); // 硬件内存屏障
-                    core::ptr::write(temp_records_ptr.add(i), *rec);
+                    if !success {
+                        // 重试失败或正在写入，终止本次读取，留待下次
+                        break;
+                    }
+
+                    // 校验读取到的数据是否有效（初始状态为 0）
+                    if rec_val.hit_time == 0 {
+                        break;
+                    }
+
+                    core::ptr::write(temp_records_ptr.add(i), rec_val);
                     tail += 1;
                     i += 1;
                 }

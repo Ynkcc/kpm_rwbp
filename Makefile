@@ -14,8 +14,16 @@ out_dir := out
 all: $(out_dir)/kpm_RWBP.kpm
 	$(MAKE) -C tests
 
+DUMP_STACK ?= 0
+
+ifeq ($(DUMP_STACK),1)
+  CARGO_FEATURES := --features dump_stack
+else
+  CARGO_FEATURES := --no-default-features
+endif
+
 rust_build:
-	RUSTFLAGS="-C relocation-model=static -C opt-level=3" rustup run nightly cargo build -Z build-std=core,compiler_builtins --target aarch64-linux-android --release
+	RUSTFLAGS="-C relocation-model=static -C opt-level=3" rustup run nightly cargo build -Z build-std=core,compiler_builtins --target aarch64-linux-android --release $(CARGO_FEATURES)
 
 $(out_dir)/kpm_RWBP.kpm: rust_build
 	mkdir -p $(out_dir)

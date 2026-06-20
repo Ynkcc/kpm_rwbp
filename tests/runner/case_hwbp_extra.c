@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
 #include "case_hwbp_extra.h"
 #include "kpm_ctrl.h"
 #include "dispatcher.h"
@@ -91,12 +92,14 @@ typedef struct {
     volatile uint64_t *shared_bp_val_ptr;
     volatile bool stop;
     long trigger_count;
+    volatile pid_t tid;
 } thread_ctx_t;
 
 // 触发断点的写线程函数
 static void* writer_thread_func(void *arg)
 {
     thread_ctx_t *ctx = (thread_ctx_t*)arg;
+    ctx->tid = gettid();
 
     // 高频写入同一个共享地址，触发断点
     volatile uint64_t *ptr = ctx->shared_bp_val_ptr;
@@ -117,18 +120,18 @@ typedef struct {
     int anon_fd;
     volatile bool stop;
     unsigned long total_hits_read;
+    volatile pid_t writer_tid;
 } reader_ctx_t;
 
 static void* reader_thread_func(void *arg)
 {
     reader_ctx_t *ctx = (reader_ctx_t*)arg;
-    uint32_t my_pid = (uint32_t)getpid();
     hwbp_hit_item_t hits[16];
 
     while (!ctx->stop) {
         hwbp_info_cmd_t icmd;
         memset(&icmd, 0, sizeof(icmd));
-        icmd.pid = my_pid;
+        icmd.pid = ctx->writer_tid;
         icmd.max_count = 16;
         icmd.user_buf = (uint64_t)hits;
 
@@ -150,24 +153,6 @@ bool run_case_hwbp_concurrency(int anon_fd)
 
     // 1. 初始化并注册单个共享断点
     volatile uint64_t shared_bp_val __attribute__((aligned(8))) = 12345678ULL;
-    uint32_t my_pid = (uint32_t)getpid();
-
-    hw_breakpoint_cmd_t bcmd;
-    memset(&bcmd, 0, sizeof(bcmd));
-    bcmd.pid = my_pid;
-    bcmd.addr = (uint64_t)&shared_bp_val;
-    bcmd.type = 3; // rw
-    bcmd.len = 8;
-    bcmd.scheme = 2;
-
-    long ret = kpm_ipc_cmd(anon_fd, OP_SET_HW_BREAKPOINT, &bcmd);
-    if (ret != 0) {
-        printf("[-] [hwbp_concurrency] 注册共享断点失败, ret=%ld\n", ret);
-        return false;
-    }
-
-    // 等待断点生效
-    usleep(100000);
 
     int num_writers = 4;
     pthread_t writers[4];
@@ -180,20 +165,26 @@ bool run_case_hwbp_concurrency(int anon_fd)
         writer_ctxs[i].shared_bp_val_ptr = &shared_bp_val;
         writer_ctxs[i].stop = false;
         writer_ctxs[i].trigger_count = 0;
+        writer_ctxs[i].tid = 0;
 
         if (pthread_create(&writers[i], NULL, writer_thread_func, &writer_ctxs[i]) != 0) {
             printf("[-] [hwbp_concurrency] 创建写线程 %d 失败\n", i);
-            kpm_ipc_cmd(anon_fd, OP_REMOVE_HW_BREAKPOINT, &bcmd);
             return false;
         }
     }
 
-    // 3. 启动读线程并发轮询命中记录
+    // 等待第一个写线程获取其内核线程ID (TID)
+    while (writer_ctxs[0].tid == 0) {
+        usleep(1000);
+    }
+
+    // 3. 启动读线程并发轮询命中记录，并传递需要监听的 TID
     pthread_t reader;
     reader_ctx_t reader_ctx;
     reader_ctx.anon_fd = anon_fd;
     reader_ctx.stop = false;
     reader_ctx.total_hits_read = 0;
+    reader_ctx.writer_tid = writer_ctxs[0].tid;
 
     if (pthread_create(&reader, NULL, reader_thread_func, &reader_ctx) != 0) {
         printf("[-] [hwbp_concurrency] 创建读线程失败\n");
@@ -202,14 +193,37 @@ bool run_case_hwbp_concurrency(int anon_fd)
             writer_ctxs[i].stop = true;
             pthread_join(writers[i], NULL);
         }
-        kpm_ipc_cmd(anon_fd, OP_REMOVE_HW_BREAKPOINT, &bcmd);
+        return false;
+    }
+
+    // 4. 注册硬件断点，把 PID/TID 设置为我们要监听的第一个写线程的内核线程ID
+    hw_breakpoint_cmd_t bcmd;
+    memset(&bcmd, 0, sizeof(bcmd));
+    bcmd.pid = (uint32_t)writer_ctxs[0].tid;
+    bcmd.addr = (uint64_t)&shared_bp_val;
+    bcmd.type = 3; // rw
+    bcmd.len = 8;
+    bcmd.scheme = 1;
+
+    long ret = kpm_ipc_cmd(anon_fd, OP_SET_HW_BREAKPOINT, &bcmd);
+    if (ret != 0) {
+        printf("[-] [hwbp_concurrency] 注册共享断点失败, ret=%ld\n", ret);
+        // 终止线程并清理
+        for (int i = 0; i < num_writers; i++) {
+            writer_ctxs[i].stop = true;
+        }
+        reader_ctx.stop = true;
+        for (int i = 0; i < num_writers; i++) {
+            pthread_join(writers[i], NULL);
+        }
+        pthread_join(reader, NULL);
         return false;
     }
 
     // 运行 2 秒钟，高压读写
     sleep(2);
 
-    // 4. 停止并清理所有线程
+    // 5. 停止并清理所有线程
     printf("[*] [hwbp_concurrency] 停止所有测试线程并清理断点...\n");
     fflush(stdout);
 

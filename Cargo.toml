@@ -23,3 +23,7 @@ build-std = ["core", "alloc","compiler_builtins"]
 
 [dependencies]
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+[features]
+default = []
+dump_stack = []
