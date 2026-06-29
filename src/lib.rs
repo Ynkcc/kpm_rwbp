@@ -51,10 +51,13 @@ use core::sync::atomic::Ordering;
 #[used]
 pub static __kpm_info_name: [u8; 14] = *b"name=kpm_RWBP\0";
 
+// 版本号 = git commit 计数（纯数字），由 build.rs 写入 kpm_version.bin
+// 模板："version=<N>\0"，内容直接内联进字节数组，KP loader 可直接扰描
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".kpm.info")]
 #[used]
-pub static __kpm_info_version: [u8; 14] = *b"version=2.0.0\0";
+pub static __kpm_info_version: [u8; include_bytes!(concat!(env!("OUT_DIR"), "/kpm_version.bin")).len()] =
+    *include_bytes!(concat!(env!("OUT_DIR"), "/kpm_version.bin"));
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".kpm.info")]
