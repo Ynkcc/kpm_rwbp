@@ -164,24 +164,23 @@ unsafe extern "C" {
 /// KP 导出的 printk 是函数指针变量的地址，不是函数地址
 /// 注意：printk 是可变参数函数，我们使用 extern "C" 声明来支持可变参数
 #[inline(always)]
-pub unsafe fn printk(fmt: *const u8) -> c_int { unsafe {
-    // 解引用函数指针变量获取实际的 printk 函数地址
-    let printk_addr = printk_ptr;
-    // 使用函数指针类型来调用
-    // 由于 printk 是可变参数函数，我们将其转换为固定参数函数指针
-    // 只传递 fmt 参数，其他参数由调用者在格式化字符串中处理
-    let printk_fn: extern "C" fn(*const u8) -> c_int = core::mem::transmute(printk_addr);
-    printk_fn(fmt)
-}}
+pub unsafe fn printk(fmt: *const u8) -> c_int {
+    unsafe {
+        let printk_addr = printk_ptr;
+        let printk_fn: extern "C" fn(*const u8) -> c_int = core::mem::transmute(printk_addr);
+        printk_fn(fmt)
+    }
+}
 
 /// 调用 kallsyms_lookup_name 函数（需要解引用 KP 导出的函数指针变量）
 #[inline(always)]
-pub unsafe fn kallsyms_lookup_name(name: *const c_char) -> core::ffi::c_ulong { unsafe {
-    // 解引用函数指针变量获取实际的函数地址
-    let kallsyms_addr = kallsyms_lookup_name_ptr;
-    let kallsyms_fn: extern "C" fn(*const c_char) -> core::ffi::c_ulong = core::mem::transmute(kallsyms_addr);
-    kallsyms_fn(name)
-}}
+pub unsafe fn kallsyms_lookup_name(name: *const c_char) -> core::ffi::c_ulong {
+    unsafe {
+        let kallsyms_addr = kallsyms_lookup_name_ptr;
+        let kallsyms_fn: extern "C" fn(*const c_char) -> core::ffi::c_ulong = core::mem::transmute(kallsyms_addr);
+        kallsyms_fn(name)
+    }
+}
 
 // =============================================================================
 // 需要运行时查找的内核 API 符号（kfunc 或内核标准导出）
@@ -342,124 +341,127 @@ unsafe impl Sync for MandatorySymbolsWrapper {}
 pub static M_SYMS: MandatorySymbolsWrapper = MandatorySymbolsWrapper(core::cell::UnsafeCell::new(None));
 
 /// 通过内核导出的 kallsyms_lookup_name，在运行时动态解析符号地址
-pub unsafe fn lookup_sym<T>(name: &str) -> Option<T> { unsafe {
+pub unsafe fn lookup_sym<T>(name: &str) -> Option<T> {
     let mut name_buf = [0u8; 128];
     if name.len() >= name_buf.len() {
         return None;
     }
-    core::ptr::copy_nonoverlapping(name.as_ptr(), name_buf.as_mut_ptr(), name.len());
-    let addr = kallsyms_lookup_name(name_buf.as_ptr() as *const c_char);
-    if addr == 0 {
-        None
-    } else {
-        Some(core::mem::transmute_copy(&addr))
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.as_ptr(), name_buf.as_mut_ptr(), name.len());
+        let addr = kallsyms_lookup_name(name_buf.as_ptr() as *const c_char);
+        if addr == 0 {
+            None
+        } else {
+            Some(core::mem::transmute_copy(&addr))
+        }
     }
-}}
+}
 
 /// 初始化需要运行时查找的内核符号
 /// KP 核心导出的符号已通过 extern 声明直接链接，无需此步
-pub unsafe fn init_symbols() -> Result<(), Error> { unsafe {
-    let syms_ptr = core::ptr::addr_of_mut!(SYMS);
+pub unsafe fn init_symbols() -> Result<(), Error> {
+    unsafe {
+        let syms_ptr = core::ptr::addr_of_mut!(SYMS);
 
-    (*syms_ptr).__kmalloc = lookup_sym("__kmalloc")
-        .or_else(|| lookup_sym("kmalloc")).ok_or(Error::ENOENT)?;
-    (*syms_ptr).kfree = lookup_sym("kfree").ok_or(Error::ENOENT)?;
-    (*syms_ptr).mmput = lookup_sym("mmput").ok_or(Error::ENOENT)?;
-    (*syms_ptr).get_task_mm = lookup_sym("get_task_mm").ok_or(Error::ENOENT)?;
-    (*syms_ptr).find_task_by_vpid = lookup_sym("find_task_by_vpid")
-        .or_else(|| lookup_sym("find_vpid")).ok_or(Error::ENOENT)?;
-    (*syms_ptr).__task_pid_nr_ns = lookup_sym("__task_pid_nr_ns").ok_or(Error::ENOENT)?;
-    
-    (*syms_ptr)._raw_spin_lock_irqsave = lookup_sym("_raw_spin_lock_irqsave")
-        .or_else(|| lookup_sym("raw_spin_lock_irqsave")).ok_or(Error::ENOENT)?;
-    (*syms_ptr)._raw_spin_unlock_irqrestore = lookup_sym("_raw_spin_unlock_irqrestore")
-        .or_else(|| lookup_sym("raw_spin_unlock_irqrestore")).ok_or(Error::ENOENT)?;
-    (*syms_ptr)._raw_spin_lock_init = lookup_sym("_raw_spin_lock_init")
-        .or_else(|| lookup_sym("raw_spin_lock_init"));
+        (*syms_ptr).__kmalloc = lookup_sym("__kmalloc")
+            .or_else(|| lookup_sym("kmalloc")).ok_or(Error::ENOENT)?;
+        (*syms_ptr).kfree = lookup_sym("kfree").ok_or(Error::ENOENT)?;
+        (*syms_ptr).mmput = lookup_sym("mmput").ok_or(Error::ENOENT)?;
+        (*syms_ptr).get_task_mm = lookup_sym("get_task_mm").ok_or(Error::ENOENT)?;
+        (*syms_ptr).find_task_by_vpid = lookup_sym("find_task_by_vpid")
+            .or_else(|| lookup_sym("find_vpid")).ok_or(Error::ENOENT)?;
+        (*syms_ptr).__task_pid_nr_ns = lookup_sym("__task_pid_nr_ns").ok_or(Error::ENOENT)?;
         
-    (*syms_ptr).__arch_copy_to_user = lookup_sym("__arch_copy_to_user")
-        .or_else(|| lookup_sym("copy_to_user")).ok_or(Error::ENOENT)?;
-    (*syms_ptr).__arch_copy_from_user = lookup_sym("__arch_copy_from_user")
-        .or_else(|| lookup_sym("copy_from_user")).ok_or(Error::ENOENT)?;
-    (*syms_ptr).access_process_vm = lookup_sym("access_process_vm").ok_or(Error::ENOENT)?;
+        (*syms_ptr)._raw_spin_lock_irqsave = lookup_sym("_raw_spin_lock_irqsave")
+            .or_else(|| lookup_sym("raw_spin_lock_irqsave")).ok_or(Error::ENOENT)?;
+        (*syms_ptr)._raw_spin_unlock_irqrestore = lookup_sym("_raw_spin_unlock_irqrestore")
+            .or_else(|| lookup_sym("raw_spin_unlock_irqrestore")).ok_or(Error::ENOENT)?;
+        (*syms_ptr)._raw_spin_lock_init = lookup_sym("_raw_spin_lock_init")
+            .or_else(|| lookup_sym("raw_spin_lock_init"));
+            
+        (*syms_ptr).__arch_copy_to_user = lookup_sym("__arch_copy_to_user")
+            .or_else(|| lookup_sym("copy_to_user")).ok_or(Error::ENOENT)?;
+        (*syms_ptr).__arch_copy_from_user = lookup_sym("__arch_copy_from_user")
+            .or_else(|| lookup_sym("copy_from_user")).ok_or(Error::ENOENT)?;
+        (*syms_ptr).access_process_vm = lookup_sym("access_process_vm").ok_or(Error::ENOENT)?;
 
-    // 可选符号 - 不存在时设为 None
-    (*syms_ptr).msleep = lookup_sym("msleep");
-    (*syms_ptr).ktime_get_real_seconds = lookup_sym("ktime_get_real_seconds");
-    (*syms_ptr).ktime_get_mono_fast_ns = lookup_sym("ktime_get_mono_fast_ns");
-    (*syms_ptr).queue_work_on = lookup_sym("queue_work_on");
-    (*syms_ptr).cancel_work_sync = lookup_sym("cancel_work_sync");
-    (*syms_ptr).cond_resched = lookup_sym("cond_resched");
-    (*syms_ptr).pfn_valid = lookup_sym("pfn_valid");
-    (*syms_ptr).valid_phys_addr_range = lookup_sym("valid_phys_addr_range");
-    (*syms_ptr).copy_from_user_nofault = lookup_sym("copy_from_user_nofault");
-    (*syms_ptr).copy_to_user_nofault = lookup_sym("copy_to_user_nofault");
-    (*syms_ptr).sscanf = lookup_sym("sscanf");
-    (*syms_ptr).sprint_symbol = lookup_sym("sprint_symbol");
-    (*syms_ptr).dump_stack = lookup_sym("dump_stack");
-    (*syms_ptr).register_user_hw_breakpoint = lookup_sym("register_user_hw_breakpoint");
-    (*syms_ptr).unregister_hw_breakpoint = lookup_sym("unregister_hw_breakpoint");
-    (*syms_ptr).modify_user_hw_breakpoint = lookup_sym("modify_user_hw_breakpoint");
-    (*syms_ptr).perf_event_disable_inatomic = lookup_sym("perf_event_disable_inatomic");
-    (*syms_ptr).perf_event_enable = lookup_sym("perf_event_enable");
-    (*syms_ptr).on_each_cpu = lookup_sym("on_each_cpu");
-    (*syms_ptr).synchronize_rcu = lookup_sym("synchronize_rcu");
-    if (*syms_ptr).synchronize_rcu.is_none() {
-        crate::pr_warn!("未找到 synchronize_rcu，降级为非阻塞释放可能有 UAF 风险！");
-    }
-    (*syms_ptr).rcu_read_lock = lookup_sym("rcu_read_lock")
-        .or_else(|| lookup_sym("__rcu_read_lock"));
-    (*syms_ptr).rcu_read_unlock = lookup_sym("rcu_read_unlock")
-        .or_else(|| lookup_sym("__rcu_read_unlock"));
+        (*syms_ptr).msleep = lookup_sym("msleep");
+        (*syms_ptr).ktime_get_real_seconds = lookup_sym("ktime_get_real_seconds");
+        (*syms_ptr).ktime_get_mono_fast_ns = lookup_sym("ktime_get_mono_fast_ns");
+        (*syms_ptr).queue_work_on = lookup_sym("queue_work_on");
+        (*syms_ptr).cancel_work_sync = lookup_sym("cancel_work_sync");
+        (*syms_ptr).cond_resched = lookup_sym("cond_resched");
+        (*syms_ptr).pfn_valid = lookup_sym("pfn_valid");
+        (*syms_ptr).valid_phys_addr_range = lookup_sym("valid_phys_addr_range");
+        (*syms_ptr).copy_from_user_nofault = lookup_sym("copy_from_user_nofault");
+        (*syms_ptr).copy_to_user_nofault = lookup_sym("copy_to_user_nofault");
+        (*syms_ptr).sscanf = lookup_sym("sscanf");
+        (*syms_ptr).sprint_symbol = lookup_sym("sprint_symbol");
+        (*syms_ptr).dump_stack = lookup_sym("dump_stack");
+        (*syms_ptr).register_user_hw_breakpoint = lookup_sym("register_user_hw_breakpoint");
+        (*syms_ptr).unregister_hw_breakpoint = lookup_sym("unregister_hw_breakpoint");
+        (*syms_ptr).modify_user_hw_breakpoint = lookup_sym("modify_user_hw_breakpoint");
+        (*syms_ptr).perf_event_disable_inatomic = lookup_sym("perf_event_disable_inatomic");
+        (*syms_ptr).perf_event_enable = lookup_sym("perf_event_enable");
+        (*syms_ptr).on_each_cpu = lookup_sym("on_each_cpu");
+        (*syms_ptr).synchronize_rcu = lookup_sym("synchronize_rcu");
+        if (*syms_ptr).synchronize_rcu.is_none() {
+            crate::pr_warn!("未找到 synchronize_rcu，降级为非阻塞释放可能有 UAF 风险！");
+        }
+        (*syms_ptr).rcu_read_lock = lookup_sym("rcu_read_lock")
+            .or_else(|| lookup_sym("__rcu_read_lock"));
+        (*syms_ptr).rcu_read_unlock = lookup_sym("rcu_read_unlock")
+            .or_else(|| lookup_sym("__rcu_read_unlock"));
 
-    (*syms_ptr).watchpoint_handler_install_hook_helper = lookup_sym("watchpoint_handler_install_hook_helper");
-    (*syms_ptr).watchpoint_handler = lookup_sym("watchpoint_handler");
+        (*syms_ptr).watchpoint_handler_install_hook_helper = lookup_sym("watchpoint_handler_install_hook_helper");
+        (*syms_ptr).watchpoint_handler = lookup_sym("watchpoint_handler");
 
-    let system_wq_sym: Option<*mut *mut c_void> = lookup_sym("system_wq");
-    if let Some(sym) = system_wq_sym {
-        (*syms_ptr).system_wq = *sym;
-    }
+        let system_wq_sym: Option<*mut *mut c_void> = lookup_sym("system_wq");
+        if let Some(sym) = system_wq_sym {
+            (*syms_ptr).system_wq = *sym;
+        }
 
-    let page_size_ptr: Option<*const i64> = lookup_sym("page_size");
-    if let Some(ptr) = page_size_ptr {
-        (*syms_ptr).page_size = *ptr;
-    }
-    let page_shift_ptr: Option<*const i64> = lookup_sym("page_shift");
-    if let Some(ptr) = page_shift_ptr {
-        (*syms_ptr).page_shift = *ptr;
-    }
+        let page_size_ptr: Option<*const i64> = lookup_sym("page_size");
+        if let Some(ptr) = page_size_ptr {
+            (*syms_ptr).page_size = *ptr;
+        }
+        let page_shift_ptr: Option<*const i64> = lookup_sym("page_shift");
+        if let Some(ptr) = page_shift_ptr {
+            (*syms_ptr).page_shift = *ptr;
+        }
 
-    let memstart_addr_ptr: Option<*const u64> = lookup_sym("memstart_addr");
-    if let Some(ptr) = memstart_addr_ptr {
-        (*syms_ptr).memstart_addr_val = *ptr;
-        let tcr_el1: u64;
-        core::arch::asm!("mrs {}, tcr_el1", out(reg) tcr_el1);
-        let va_bits_local = 64 - ((tcr_el1 >> 16) & 0x1F);
+        let memstart_addr_ptr: Option<*const u64> = lookup_sym("memstart_addr");
+        if let Some(ptr) = memstart_addr_ptr {
+            (*syms_ptr).memstart_addr_val = *ptr;
+            let tcr_el1: u64;
+            core::arch::asm!("mrs {}, tcr_el1", out(reg) tcr_el1);
+            let va_bits_local = 64 - ((tcr_el1 >> 16) & 0x1F);
 
-        if kver < ((5 << 16) + (4 << 8) + 0) {
-            (*syms_ptr).page_offset_val = !0u64 << (va_bits_local - 1);
+            if kver < ((5 << 16) + (4 << 8) + 0) {
+                (*syms_ptr).page_offset_val = !0u64 << (va_bits_local - 1);
+            } else {
+                (*syms_ptr).page_offset_val = !0u64 << va_bits_local;
+            }
+            (*syms_ptr).linear_voffset = (*syms_ptr).page_offset_val.wrapping_sub((*syms_ptr).memstart_addr_val);
         } else {
-            (*syms_ptr).page_offset_val = !0u64 << va_bits_local;
-        }
-        (*syms_ptr).linear_voffset = (*syms_ptr).page_offset_val.wrapping_sub((*syms_ptr).memstart_addr_val);
-    } else {
-            return Err(Error::ENOENT);
-        }
+                return Err(Error::ENOENT);
+            }
 
-    let m_syms = MandatorySymbols {
-        kmalloc: (*syms_ptr).__kmalloc.ok_or(Error::ENOENT)?,
-        kfree: (*syms_ptr).kfree.ok_or(Error::ENOENT)?,
-        mmput: (*syms_ptr).mmput.ok_or(Error::ENOENT)?,
-        get_task_mm: (*syms_ptr).get_task_mm.ok_or(Error::ENOENT)?,
-        find_task_by_vpid: (*syms_ptr).find_task_by_vpid.ok_or(Error::ENOENT)?,
-        __task_pid_nr_ns: (*syms_ptr).__task_pid_nr_ns.ok_or(Error::ENOENT)?,
-        _raw_spin_lock_irqsave: (*syms_ptr)._raw_spin_lock_irqsave.ok_or(Error::ENOENT)?,
-        _raw_spin_unlock_irqrestore: (*syms_ptr)._raw_spin_unlock_irqrestore.ok_or(Error::ENOENT)?,
-        __arch_copy_to_user: (*syms_ptr).__arch_copy_to_user.ok_or(Error::ENOENT)?,
-        __arch_copy_from_user: (*syms_ptr).__arch_copy_from_user.ok_or(Error::ENOENT)?,
-        access_process_vm: (*syms_ptr).access_process_vm.ok_or(Error::ENOENT)?,
-    };
-    *M_SYMS.0.get() = Some(m_syms);
+        let m_syms = MandatorySymbols {
+            kmalloc: (*syms_ptr).__kmalloc.ok_or(Error::ENOENT)?,
+            kfree: (*syms_ptr).kfree.ok_or(Error::ENOENT)?,
+            mmput: (*syms_ptr).mmput.ok_or(Error::ENOENT)?,
+            get_task_mm: (*syms_ptr).get_task_mm.ok_or(Error::ENOENT)?,
+            find_task_by_vpid: (*syms_ptr).find_task_by_vpid.ok_or(Error::ENOENT)?,
+            __task_pid_nr_ns: (*syms_ptr).__task_pid_nr_ns.ok_or(Error::ENOENT)?,
+            _raw_spin_lock_irqsave: (*syms_ptr)._raw_spin_lock_irqsave.ok_or(Error::ENOENT)?,
+            _raw_spin_unlock_irqrestore: (*syms_ptr)._raw_spin_unlock_irqrestore.ok_or(Error::ENOENT)?,
+            __arch_copy_to_user: (*syms_ptr).__arch_copy_to_user.ok_or(Error::ENOENT)?,
+            __arch_copy_from_user: (*syms_ptr).__arch_copy_from_user.ok_or(Error::ENOENT)?,
+            access_process_vm: (*syms_ptr).access_process_vm.ok_or(Error::ENOENT)?,
+        };
+        *M_SYMS.0.get() = Some(m_syms);
 
-    Ok(())
-}}
+        Ok(())
+    }
+}

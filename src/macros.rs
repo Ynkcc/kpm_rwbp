@@ -2,6 +2,7 @@
 use core::fmt;
 
 /// 辅助宏：从 SYMS 缓存中获取符号（用于仍需运行时查找的内核 API）
+#[allow(unused_unsafe)]
 #[macro_export]
 macro_rules! sym {
     ($field:ident) => {
@@ -10,6 +11,7 @@ macro_rules! sym {
 }
 
 /// 辅助宏：直接获取绝对存在的必要符号，无需运行时 Option 解包分支
+#[allow(unused_unsafe)]
 #[macro_export]
 macro_rules! sym_must {
     ($field:ident) => {

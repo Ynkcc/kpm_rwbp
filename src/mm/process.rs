@@ -82,35 +82,37 @@ impl Arm64Paging {
     }
 }
 
-pub unsafe fn pgtable_phys(pgd_va: u64, va: u64) -> u64 { unsafe {
+pub unsafe fn pgtable_phys(pgd_va: u64, va: u64) -> u64 {
     let paging = Arm64Paging::new();
     let pxd_bits = paging.pxd_bits;
     let pxd_ptrs = paging.pxd_ptrs;
     let mut cur_pxd_va = pgd_va;
     let mut pxd_pa = 0;
 
-    for lv in (4 - paging.page_level)..4 {
-        let pxd_shift = pxd_bits * (4 - lv) + 3;
-        let pxd_index = ((va >> pxd_shift) & (pxd_ptrs - 1)) as usize;
+    unsafe {
+        for lv in (4 - paging.page_level)..4 {
+            let pxd_shift = pxd_bits * (4 - lv) + 3;
+            let pxd_index = ((va >> pxd_shift) & (pxd_ptrs - 1)) as usize;
 
-        let pxd_entry_ptr = (cur_pxd_va + (pxd_index as u64 * 8)) as *const u64;
-        let pxd_desc = *pxd_entry_ptr;
+            let pxd_entry_ptr = (cur_pxd_va + (pxd_index as u64 * 8)) as *const u64;
+            let pxd_desc = *pxd_entry_ptr;
 
-        let valid_table = pxd_desc & 0b11;
-        if valid_table == 0b11 {
-            let mask = ((1u64 << (48 - paging.page_shift)) - 1) << paging.page_shift;
-            pxd_pa = pxd_desc & mask;
-        } else if valid_table == 0b01 {
-            let bits_val = (3 - lv) * pxd_bits;
-            let block_bits = bits_val + paging.page_shift;
-            let mask = ((1u64 << (48 - block_bits)) - 1) << block_bits;
-            pxd_pa = (pxd_desc & mask) + (va & (((1u64 << bits_val) - 1) << paging.page_shift));
-            break;
-        } else {
-            return 0;
+            let valid_table = pxd_desc & 0b11;
+            if valid_table == 0b11 {
+                let mask = ((1u64 << (48 - paging.page_shift)) - 1) << paging.page_shift;
+                pxd_pa = pxd_desc & mask;
+            } else if valid_table == 0b01 {
+                let bits_val = (3 - lv) * pxd_bits;
+                let block_bits = bits_val + paging.page_shift;
+                let mask = ((1u64 << (48 - block_bits)) - 1) << block_bits;
+                pxd_pa = (pxd_desc & mask) + (va & (((1u64 << bits_val) - 1) << paging.page_shift));
+                break;
+            } else {
+                return 0;
+            }
+
+            cur_pxd_va = pxd_pa.wrapping_add(crate::ffi::SYMS.linear_voffset);
         }
-
-        cur_pxd_va = pxd_pa.wrapping_add(crate::ffi::SYMS.linear_voffset);
     }
 
     if pxd_pa != 0 {
@@ -118,7 +120,7 @@ pub unsafe fn pgtable_phys(pgd_va: u64, va: u64) -> u64 { unsafe {
     } else {
         0
     }
-}}
+}
 
 #[derive(Clone, Copy)]
 struct PmdWalkResult {
@@ -128,44 +130,46 @@ struct PmdWalkResult {
     block_phys_base: u64,
 }
 
-unsafe fn walk_to_pmd(pgd_va: u64, va: u64, paging: &Arm64Paging) -> PmdWalkResult { unsafe {
+unsafe fn walk_to_pmd(pgd_va: u64, va: u64, paging: &Arm64Paging) -> PmdWalkResult {
     let pxd_bits = paging.pxd_bits;
     let pxd_ptrs = paging.pxd_ptrs;
     let mut cur_pxd_va = pgd_va;
 
-    for lv in (4 - paging.page_level)..=2 {
-        let pxd_shift = pxd_bits * (4 - lv) + 3;
-        let pxd_index = ((va >> pxd_shift) & (pxd_ptrs - 1)) as usize;
+    unsafe {
+        for lv in (4 - paging.page_level)..=2 {
+            let pxd_shift = pxd_bits * (4 - lv) + 3;
+            let pxd_index = ((va >> pxd_shift) & (pxd_ptrs - 1)) as usize;
 
-        let pxd_entry_ptr = (cur_pxd_va + (pxd_index as u64 * 8)) as *const u64;
-        let pxd_desc = *pxd_entry_ptr;
+            let pxd_entry_ptr = (cur_pxd_va + (pxd_index as u64 * 8)) as *const u64;
+            let pxd_desc = *pxd_entry_ptr;
 
-        let valid_table = pxd_desc & 0b11;
-        if valid_table == 0b11 {
-            let mask = ((1u64 << (48 - paging.page_shift)) - 1) << paging.page_shift;
-            let pxd_pa = pxd_desc & mask;
-            if lv == 2 {
+            let valid_table = pxd_desc & 0b11;
+            if valid_table == 0b11 {
+                let mask = ((1u64 << (48 - paging.page_shift)) - 1) << paging.page_shift;
+                let pxd_pa = pxd_desc & mask;
+                if lv == 2 {
+                    return PmdWalkResult {
+                        is_table: true,
+                        is_block: false,
+                        pte_table_va: pxd_pa.wrapping_add(crate::ffi::SYMS.linear_voffset),
+                        block_phys_base: 0,
+                    };
+                }
+                cur_pxd_va = pxd_pa.wrapping_add(crate::ffi::SYMS.linear_voffset);
+            } else if valid_table == 0b01 {
+                let bits_val = (3 - lv) * pxd_bits;
+                let block_bits = bits_val + paging.page_shift;
+                let mask = ((1u64 << (48 - block_bits)) - 1) << block_bits;
+                let block_pa = pxd_desc & mask;
                 return PmdWalkResult {
-                    is_table: true,
-                    is_block: false,
-                    pte_table_va: pxd_pa.wrapping_add(crate::ffi::SYMS.linear_voffset),
-                    block_phys_base: 0,
+                    is_table: false,
+                    is_block: true,
+                    pte_table_va: 0,
+                    block_phys_base: block_pa,
                 };
+            } else {
+                break;
             }
-            cur_pxd_va = pxd_pa.wrapping_add(crate::ffi::SYMS.linear_voffset);
-        } else if valid_table == 0b01 {
-            let bits_val = (3 - lv) * pxd_bits;
-            let block_bits = bits_val + paging.page_shift;
-            let mask = ((1u64 << (48 - block_bits)) - 1) << block_bits;
-            let block_pa = pxd_desc & mask;
-            return PmdWalkResult {
-                is_table: false,
-                is_block: true,
-                pte_table_va: 0,
-                block_phys_base: block_pa,
-            };
-        } else {
-            break;
         }
     }
 
@@ -175,7 +179,7 @@ unsafe fn walk_to_pmd(pgd_va: u64, va: u64, paging: &Arm64Paging) -> PmdWalkResu
         pte_table_va: 0,
         block_phys_base: 0,
     }
-}}
+}
 
 /// 读取指定进程的用户虚拟内存数据，并安全写入另一个用户态虚拟地址（零拷贝直接读取，支持PTE缓存）
 pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64) -> Result<usize, Error> {
