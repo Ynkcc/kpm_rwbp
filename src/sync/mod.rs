@@ -134,3 +134,7 @@ pub fn smp_rmb() {
     }
 }
 
+pub mod arc;
+pub use arc::KernelArc;
+
+

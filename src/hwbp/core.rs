@@ -1,11 +1,11 @@
 // 硬件断点/监视点核心业务与生命周期管理
 
 use crate::ffi::{get_current, PerfEventAttr};
-use crate::sync::RawSpinlock;
-use crate::utils::ListHead;
+use crate::sync::{RawSpinlock, KernelArc};
+use crate::utils::{ListHead, Error};
 use core::ffi::c_void;
 use core::ffi::c_int;
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering, AtomicBool, AtomicU32};
+use core::sync::atomic::{AtomicI32, Ordering, AtomicBool, AtomicU64, AtomicU32};
 use zerocopy::{FromBytes, IntoBytes, Immutable, KnownLayout};
 
 // 全局状态变量
@@ -84,7 +84,13 @@ pub struct HwbpNode {
     pub hit_record_head: AtomicU64, // 写入游标 (单调递增)
     pub hit_record_tail: AtomicU64, // 读取游标 (单调递增)
     pub active: AtomicBool,
-    pub refcnt: AtomicI32,
+}
+
+impl Drop for HwbpNode {
+    fn drop(&mut self) {
+        pr_info!("kpm_rwbp: HwbpNode 被物理释放, 目标地址=0x{:x}, PID={}", self.addr, self.pid);
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// 注册断点工作包装结构
@@ -247,12 +253,8 @@ pub unsafe extern "C" fn recovery_bp_work_func(work: *mut WorkStruct) {
     }
     (*node).is_temp_bp.store(false, Ordering::Release);
     
-    // 递减工作项继承的引用计数。如果是最后一个扣减引用的，则物理释放资源。
-    if (*node).refcnt.fetch_sub(1, Ordering::Release) == 1 {
-        let free_fn = crate::sym_must!(kfree);
-        free_fn(node as *const c_void);
-        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-    }
+    // 递减工作项继承的引用计数。利用 KernelArc 的 Drop 自动进行物理释放与计数管理。
+    let _arc = KernelArc::from_raw_transferred(node);
 }
 
 pub unsafe extern "C" fn write_wp_regs_on_cpu(info: *mut c_void) {
@@ -283,7 +285,8 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
     if let Some(cancel_fn) = crate::sym!(cancel_work_sync) {
         let cancelled = cancel_fn(&mut (*node).recovery_work as *mut _ as *mut c_void);
         if cancelled != 0 {
-            (*node).refcnt.fetch_sub(1, Ordering::Release);
+            // 被取消的恢复工作项持有的强引用所有权在此回收并 Drop
+            let _ = KernelArc::from_raw_transferred(node);
         }
     }
 
@@ -319,12 +322,8 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
         sync_rcu();
     }
 
-    // 递减注册占用引用。如果是最后一个扣减引用的，则物理释放资源。
-    if (*node).refcnt.fetch_sub(1, Ordering::Release) == 1 {
-        let free_fn = crate::sym_must!(kfree);
-        free_fn(node as *const c_void);
-        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-    }
+    // 3. 释放注册占用引用（即当前注销工作本身持有的强引用所有权）。离开作用域时自动物理释放（如引用为0）。
+    let _arc = KernelArc::from_raw_transferred(node);
 }
 
 /// ARM64 处理器寄存器布局
@@ -385,9 +384,9 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
                             .is_ok()
                     } {
                         (*node).hit_count.fetch_add(1, Ordering::Relaxed);
-                        // 递增引用计数
-                        (*node).refcnt.fetch_add(1, Ordering::Relaxed);
-                        found_node = node;
+                        // 递增引用计数并转换成裸指针暂存，以防生命周期逃逸
+                        let arc = KernelArc::from_raw(node);
+                        found_node = arc.into_raw();
                     }
                     break;
                 }
@@ -455,11 +454,7 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
 
         // 递减引用计数（如果未成功转移给工作队列）
         if !ref_transferred {
-            if (*found_node).refcnt.fetch_sub(1, Ordering::Release) == 1 {
-                let free_fn = crate::sym_must!(kfree);
-                free_fn(found_node as *const c_void);
-                IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-            }
+            let _ = KernelArc::from_raw_transferred(found_node);
         }
     }
 }
@@ -480,9 +475,9 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
         let node_offset = core::mem::offset_of!(HwbpNode, list);
         let node = (curr as usize - node_offset) as *mut HwbpNode;
         if unsafe { (*node).bp == bp && (*node).active.load(Ordering::Acquire) } {
-            // 找到节点，递增引用计数
-            (*node).refcnt.fetch_add(1, Ordering::Relaxed);
-            found_node = node;
+            // 找到节点，递增引用计数并转换成裸指针暂存
+            let arc = KernelArc::from_raw(node);
+            found_node = arc.into_raw();
             break;
         }
         curr = unsafe { (*curr).next_rcu() };
@@ -495,7 +490,7 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
 
     if unsafe { (*found_node).scheme == 1 && (*found_node).is_temp_bp.load(Ordering::Acquire) } {
         // 提前返回必须递减引用计数！
-        unsafe { (*found_node).refcnt.fetch_sub(1, Ordering::Release); }
+        unsafe { let _ = KernelArc::from_raw_transferred(found_node); }
         return;
     }
 
@@ -600,11 +595,7 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
     // 结束执行前，如果引用没有转移给恢复工作项，则递减引用计数
     if !ref_transferred {
         unsafe {
-            if (*found_node).refcnt.fetch_sub(1, Ordering::Release) == 1 {
-                let free_fn = crate::sym_must!(kfree);
-                free_fn(found_node as *const c_void);
-                IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-            }
+            let _ = KernelArc::from_raw_transferred(found_node);
         }
     }
 }
@@ -665,7 +656,7 @@ pub fn register_hwbp(
     bp_type: u32,
     len: u32,
     scheme: u32,
-) -> Result<(), i32> {
+) -> Result<(), Error> {
     pr_info!("register_hwbp: PID={}, 地址=0x{:x}, 类型={}, 长度={}, 方案={}", pid, addr, bp_type, len, scheme);
 
     // 检查重复注册
@@ -676,9 +667,8 @@ pub fn register_hwbp(
         let node_offset = core::mem::offset_of!(HwbpNode, list);
         let node = (curr as usize - node_offset) as *mut HwbpNode;
         if unsafe { (*node).pid == pid && (*node).addr == addr } {
-            // 尽早显式释放锁以符合优化实践
             drop(guard);
-            return Err(-17); // EEXIST
+            return Err(Error::EEXIST);
         }
         curr = unsafe { (*curr).next };
     }
@@ -686,16 +676,15 @@ pub fn register_hwbp(
 
     if scheme == 999 {
         pr_err!("register_hwbp: 方案 999 已被废弃，直接返回错误");
-        return Err(-22); // EINVAL
+        return Err(Error::EINVAL);
     }
     if scheme != 1 && scheme != 2 {
         pr_err!("register_hwbp: 不支持的方案 {}，仅支持方案 1 和 2", scheme);
-        return Err(-22); // EINVAL
+        return Err(Error::EINVAL);
     }
 
     if scheme == 2 {
         unsafe {
-            // 延迟加载 watchpoint hook
             let install_fn = crate::sym!(watchpoint_handler_install_hook_helper); 
             if let Some(install) = install_fn {
                 install();
@@ -703,37 +692,27 @@ pub fn register_hwbp(
                 crate::hooks::watchpoint::install_wp_hook(before_watchpoint_handler as *const c_void);
             }
 
-            let malloc_fn = crate::sym_must!(kmalloc);
-            let node_ptr = malloc_fn(core::mem::size_of::<HwbpNode>(), 0x20u32) as *mut HwbpNode; // GFP_ATOMIC
-            if node_ptr.is_null() {
-                return Err(-12); // ENOMEM
-            }
-            core::ptr::write_bytes(node_ptr as *mut u8, 0, core::mem::size_of::<HwbpNode>());
+            let node: KernelArc<HwbpNode> = KernelArc::new_zeroed().map_err(|_| Error::ENOMEM)?;
+            let node_raw = node.as_raw();
 
-            (*node_ptr).bp = core::ptr::null_mut();
-            (*node_ptr).pid = pid;
-            (*node_ptr).addr = addr;
-            (*node_ptr).bp_type = bp_type;
-            (*node_ptr).len = len;
-            (*node_ptr).scheme = 2; // 原 Scheme 3 改为 Scheme 2
-            (*node_ptr).hit_count = AtomicU64::new(0);
-            (*node_ptr).is_temp_bp = AtomicBool::new(false);
-            (*node_ptr).hit_record_head = AtomicU64::new(0);
-            (*node_ptr).hit_record_tail = AtomicU64::new(0);
-            for idx in 0..16 {
-                core::ptr::write(&mut (*node_ptr).hit_record_seqs[idx], AtomicU32::new(0));
-            }
-            (*node_ptr).recovery_work.init(recovery_bp_work_func);
-            (*node_ptr).active = AtomicBool::new(true);
-            (*node_ptr).refcnt = AtomicI32::new(1);
+            (*node_raw).pid = pid;
+            (*node_raw).addr = addr;
+            (*node_raw).bp_type = bp_type;
+            (*node_raw).len = len;
+            (*node_raw).scheme = 2;
+            (*node_raw).active.store(true, Ordering::Release);
+            (*node_raw).recovery_work.init(recovery_bp_work_func);
 
             let guard = BP_LIST_LOCK.lock();
             let bp_list_ptr = BP_LIST.get_ptr();
-            (*bp_list_ptr).add_rcu(&mut (*node_ptr).list);
+            (*bp_list_ptr).add_rcu(&mut (*node_raw).list);
             drop(guard);
 
+            // 成功加入列表，转移 KernelArc 拥有的强引用给列表
+            let _ = node.into_raw();
+
             if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
-                on_each_cpu(write_wp_regs_on_cpu, node_ptr as *mut c_void, 1);
+                on_each_cpu(write_wp_regs_on_cpu, node_raw as *mut c_void, 1);
             }
             pr_info!("register_hwbp 方案 2: 初始化启用成功");
         }
@@ -744,7 +723,7 @@ pub fn register_hwbp(
         let find_fn = crate::sym_must!(find_task_by_vpid);
         let task_ptr = find_fn(pid as i32);
         if task_ptr.is_null() {
-            return Err(-3);
+            return Err(Error::ESRCH);
         }
         task_ptr
     };
@@ -763,46 +742,42 @@ pub fn register_hwbp(
     attr.bp_len = len as u64;
 
     unsafe {
-        let reg_fn = crate::sym!(register_user_hw_breakpoint).ok_or(-38)?;
+        let reg_fn = crate::sym!(register_user_hw_breakpoint).ok_or(Error::ENOSYS)?;
         let bp = reg_fn(&mut attr, hwbp_triggered, core::ptr::null_mut(), task);
         let bp_err = bp as isize;
         if bp_err < 0 && bp_err > -4096 {
             pr_err!("register_hwbp: 硬件断点注册失败, 错误码={}", bp_err);
-            return Err(bp_err as i32);
+            return Err(Error::from(bp_err as i32));
         }
 
-        let malloc_fn = crate::sym_must!(kmalloc);
-        let node_ptr = malloc_fn(core::mem::size_of::<HwbpNode>(), 0x20u32) as *mut HwbpNode;
-        if node_ptr.is_null() {
-            if let Some(unreg_fn) = crate::sym!(unregister_hw_breakpoint) {
-                unreg_fn(bp);
+        let node: KernelArc<HwbpNode> = match KernelArc::new_zeroed() {
+            Ok(n) => n,
+            Err(e) => {
+                if let Some(unreg_fn) = crate::sym!(unregister_hw_breakpoint) {
+                    unreg_fn(bp);
+                }
+                return Err(Error::from(e));
             }
-            return Err(-12); // ENOMEM
-        }
-        core::ptr::write_bytes(node_ptr as *mut u8, 0, core::mem::size_of::<HwbpNode>());
+        };
 
-        (*node_ptr).bp = bp;
-        (*node_ptr).pid = pid;
-        (*node_ptr).addr = addr;
-        (*node_ptr).bp_type = bp_type;
-        (*node_ptr).len = len;
-        (*node_ptr).scheme = scheme;
-        (*node_ptr).hit_count = AtomicU64::new(0);
-        (*node_ptr).orig_attr = attr;
-        (*node_ptr).is_temp_bp = AtomicBool::new(false);
-        (*node_ptr).hit_record_head = AtomicU64::new(0);
-        (*node_ptr).hit_record_tail = AtomicU64::new(0);
-        for idx in 0..16 {
-            core::ptr::write(&mut (*node_ptr).hit_record_seqs[idx], AtomicU32::new(0));
-        }
-        (*node_ptr).recovery_work.init(recovery_bp_work_func);
-        (*node_ptr).active = AtomicBool::new(true);
-        (*node_ptr).refcnt = AtomicI32::new(1);
+        let node_raw = node.as_raw();
+        (*node_raw).bp = bp;
+        (*node_raw).pid = pid;
+        (*node_raw).addr = addr;
+        (*node_raw).bp_type = bp_type;
+        (*node_raw).len = len;
+        (*node_raw).scheme = scheme;
+        (*node_raw).orig_attr = attr;
+        (*node_raw).active.store(true, Ordering::Release);
+        (*node_raw).recovery_work.init(recovery_bp_work_func);
 
         let guard = BP_LIST_LOCK.lock();
         let bp_list_ptr = BP_LIST.get_ptr();
-        (*bp_list_ptr).add_rcu(&mut (*node_ptr).list);
+        (*bp_list_ptr).add_rcu(&mut (*node_raw).list);
         drop(guard);
+
+        // 成功加入列表，转移 KernelArc 拥有的强引用给列表
+        let _ = node.into_raw();
 
         if let Some(enable_fn) = crate::sym!(perf_event_enable) {
             enable_fn(bp);
@@ -814,7 +789,7 @@ pub fn register_hwbp(
 }
 
 /// 注销指定地址 of 进程硬件断点
-pub fn unregister_hwbp(pid: u32, addr: u64) -> Result<(), i32> {
+pub fn unregister_hwbp(pid: u32, addr: u64) -> Result<(), Error> {
     let mut target_node: *mut HwbpNode = core::ptr::null_mut();
 
     let guard = BP_LIST_LOCK.lock();
@@ -836,24 +811,30 @@ pub fn unregister_hwbp(pid: u32, addr: u64) -> Result<(), i32> {
     drop(guard);
 
     if target_node.is_null() {
-        return Err(-2); // ENOENT
+        return Err(Error::ENOENT);
     }
 
     unsafe {
+        let arc = KernelArc::from_raw_transferred(target_node);
         IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         (*target_node).unreg_work.init(unregister_bp_work_func);
+
         if let Some(queue_fn) = crate::sym!(queue_work_on) {
             let success = queue_fn(
                 0,
                 crate::sym!(system_wq),
                 &mut (*target_node).unreg_work as *mut _ as *mut c_void,
             );
-            if success == 0 {
-                IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            if success != 0 {
+                // 入队成功，转移所有权给工作项
+                let _ = arc.into_raw();
             }
+            // 若 success == 0，表明排队失败。arc 将在此作用域结束时被自动 Drop 释放。
+            // 物理释放时，其 Drop 会自动执行 IN_FLIGHT.fetch_sub(1)，因此此处无需手动扣减。
         } else {
-            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-            unregister_bp_work_func(&mut (*target_node).unreg_work);
+            // 无 queue_work_on 符号，同步调用
+            let raw_node = arc.into_raw();
+            unregister_bp_work_func(&mut (*raw_node).unreg_work);
         }
     }
 
@@ -861,7 +842,7 @@ pub fn unregister_hwbp(pid: u32, addr: u64) -> Result<(), i32> {
 }
 
 /// 注销所有的硬件断点
-pub fn unregister_all_hwbp() -> Result<(), i32> {
+pub fn unregister_all_hwbp() -> Result<(), Error> {
     let mut head_to_free: *mut HwbpNode = core::ptr::null_mut();
 
     let guard = BP_LIST_LOCK.lock();
@@ -888,21 +869,23 @@ pub fn unregister_all_hwbp() -> Result<(), i32> {
     while !curr_node.is_null() {
         unsafe {
             let next_node = (*curr_node).unreg_work.data as *mut HwbpNode;
+            let arc = KernelArc::from_raw_transferred(curr_node);
 
             IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
             (*curr_node).unreg_work.init(unregister_bp_work_func);
+
             if let Some(queue_fn) = crate::sym!(queue_work_on) {
                 let success = queue_fn(
                     0,
                     crate::sym!(system_wq),
                     &mut (*curr_node).unreg_work as *mut _ as *mut c_void,
                 );
-                if success == 0 {
-                    IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                if success != 0 {
+                    let _ = arc.into_raw();
                 }
             } else {
-                IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                unregister_bp_work_func(&mut (*curr_node).unreg_work);
+                let raw_node = arc.into_raw();
+                unregister_bp_work_func(&mut (*raw_node).unreg_work);
             }
 
             curr_node = next_node;
@@ -918,21 +901,20 @@ pub fn read_hwbp_info(
     max_count: u64,
     user_buf: *mut c_void,
     actual_count: &mut u64,
-) -> Result<(), i32> {
+) -> Result<(), Error> {
     if max_count == 0 || user_buf.is_null() {
-        return Err(-22); // EINVAL
+        return Err(Error::EINVAL);
     }
 
-    // 动态分配 16 个记录的堆空间，消除内核栈溢出隐患（约 4.6KB）
     let malloc_fn = crate::sym_must!(kmalloc);
     let temp_records_ptr = unsafe {
         malloc_fn(
             16 * core::mem::size_of::<HwbpHitRecord>(),
-            0x20u32, // GFP_ATOMIC
+            0x20u32,
         )
     } as *mut HwbpHitRecord;
     if temp_records_ptr.is_null() {
-        return Err(-12); // ENOMEM
+        return Err(Error::ENOMEM);
     }
 
     struct TempRecordsGuard(*mut HwbpHitRecord);
@@ -947,9 +929,9 @@ pub fn read_hwbp_info(
     let _records_guard = TempRecordsGuard(temp_records_ptr);
 
     let mut count_to_copy = 0;
-    let mut found_node: *mut HwbpNode = core::ptr::null_mut();
+    let mut _found_node: Option<KernelArc<HwbpNode>> = None;
 
-    // 读者保护的 RcuReadGuard
+    // 读者保护 of RcuReadGuard
     let _rcu_guard = crate::sync::RcuReadGuard::new();
 
     let bp_list_ptr = BP_LIST.get_ptr();
@@ -959,9 +941,8 @@ pub fn read_hwbp_info(
         let node = (curr as usize - node_offset) as *mut HwbpNode;
         unsafe {
             if (*node).pid == pid {
-                // 找到节点，递增引用计数
-                (*node).refcnt.fetch_add(1, Ordering::Relaxed);
-                found_node = node;
+                // 找到节点，递增引用并存入 Option 以保证其在函数运行期间的强引用生命周期
+                _found_node = Some(KernelArc::from_raw(node));
 
                 let head = (*node).hit_record_head.load(Ordering::Acquire);
                 let mut tail = (*node).hit_record_tail.load(Ordering::Acquire);
@@ -1038,23 +1019,6 @@ pub fn read_hwbp_info(
         curr = unsafe { (*curr).next_rcu() };
     }
 
-    struct NodeGuard(*mut HwbpNode);
-    impl Drop for NodeGuard {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe {
-                    if (*self.0).refcnt.fetch_sub(1, Ordering::Release) == 1 {
-                        if let Some(free_fn) = crate::sym!(kfree) {
-                            free_fn(self.0 as *const c_void);
-                        }
-                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                    }
-                }
-            }
-        }
-    }
-    let _guard = NodeGuard(found_node);
-
     // 【修复】：显式释放 RCU 读锁，防止后续 copy_to_user 缺页休眠导致死锁
     drop(_rcu_guard);
 
@@ -1076,7 +1040,7 @@ pub fn read_hwbp_info(
         } else {
             let copy_res = copy_to_user(dst, record_ref.as_bytes());
             if copy_res.is_err() {
-                return Err(-14); // EFAULT
+                return Err(Error::EFAULT);
             }
         }
     }
