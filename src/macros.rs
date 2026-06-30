@@ -9,6 +9,16 @@ macro_rules! sym {
     };
 }
 
+/// 辅助宏：直接获取绝对存在的必要符号，无需运行时 Option 解包分支
+#[macro_export]
+macro_rules! sym_must {
+    ($field:ident) => {
+        unsafe {
+            (*$crate::ffi::M_SYMS.0.get()).as_ref().unwrap_unchecked().$field
+        }
+    };
+}
+
 /// 栈上日志缓冲区，安全转换 Rust 格式化与 C 字符串
 pub struct KernelBufWriter {
     pub buf: [u8; 512],

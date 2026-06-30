@@ -8,7 +8,7 @@ pub mod symbols;
 
 pub use offsets::{TaskStructOffset, CredOffset, MmStructOffset};
 pub use symbols::{
-    PerfEventAttr, lookup_sym, init_symbols, kver, SYMS,
+    PerfEventAttr, lookup_sym, init_symbols, kver, SYMS, M_SYMS, MandatorySymbols,
     has_syscall_wrapper, kallsyms_lookup_name,
     // 直接可用的 KP 核心导出符号（无需 init_symbols）
     hook_syscalln, unhook_syscalln, hook_wrap, hook_unwrap_remove,

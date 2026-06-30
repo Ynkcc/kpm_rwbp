@@ -1,4 +1,3 @@
-use crate::ffi::lookup_sym;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering, AtomicU64};
 
@@ -12,7 +11,7 @@ pub unsafe fn install_wp_hook(callback: *const c_void) {
         return;
     }
 
-    let wp_handler_addr: Option<*mut c_void> = lookup_sym("watchpoint_handler");
+    let wp_handler_addr = crate::sym!(watchpoint_handler);
     if let Some(addr) = wp_handler_addr {
         // hook_wrap 是 KP 导出的直接 extern 函数
         let err = crate::ffi::hook_wrap(
@@ -38,7 +37,7 @@ pub unsafe fn install_wp_hook(callback: *const c_void) {
 /// 卸载 watchpoint_handler 拦截钩子
 pub unsafe fn remove_wp_hook() {
     if HOOK_INSTALLED.compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
-        let wp_handler_addr: Option<*mut c_void> = lookup_sym("watchpoint_handler");
+        let wp_handler_addr = crate::sym!(watchpoint_handler);
         let callback = INSTALLED_CALLBACK.swap(0, Ordering::SeqCst) as *const c_void;
         if let Some(addr) = wp_handler_addr {
             if !callback.is_null() {

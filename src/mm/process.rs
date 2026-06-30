@@ -8,11 +8,10 @@ pub fn copy_to_user(to: *mut c_void, from: &[u8]) -> Result<(), i32> {
         return Err(-14); // EFAULT
     }
     unsafe {
-        if let Some(copy_fn) = crate::sym!(__arch_copy_to_user) {
-            let ret = copy_fn(to, from.as_ptr() as *const c_void, from.len() as u64);
-            if ret == 0 {
-                return Ok(());
-            }
+        let copy_fn = crate::sym_must!(__arch_copy_to_user);
+        let ret = copy_fn(to, from.as_ptr() as *const c_void, from.len() as u64);
+        if ret == 0 {
+            return Ok(());
         }
         if let Some(copy_fn) = crate::sym!(copy_to_user_nofault) {
             let ret = copy_fn(to, from.as_ptr() as *const c_void, from.len());
@@ -30,11 +29,10 @@ pub fn copy_from_user(to: &mut [u8], from: *const c_void) -> Result<(), i32> {
         return Err(-14); // EFAULT
     }
     unsafe {
-        if let Some(copy_fn) = crate::sym!(__arch_copy_from_user) {
-            let ret = copy_fn(to.as_mut_ptr() as *mut c_void, from, to.len() as u64);
-            if ret == 0 {
-                return Ok(());
-            }
+        let copy_fn = crate::sym_must!(__arch_copy_from_user);
+        let ret = copy_fn(to.as_mut_ptr() as *mut c_void, from, to.len() as u64);
+        if ret == 0 {
+            return Ok(());
         }
         if let Some(copy_fn) = crate::sym!(copy_from_user_nofault) {
             let ret = copy_fn(to.as_mut_ptr() as *mut c_void, from, to.len());
@@ -181,22 +179,16 @@ unsafe fn walk_to_pmd(pgd_va: u64, va: u64, paging: &Arm64Paging) -> PmdWalkResu
 /// 读取指定进程的用户虚拟内存数据，并安全写入另一个用户态虚拟地址（零拷贝直接读取，支持PTE缓存）
 pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64) -> Result<usize, i32> {
     let task = unsafe {
-        if let Some(find_fn) = crate::sym!(find_task_by_vpid) {
-            find_fn(pid as i32)
-        } else {
-            return Err(-3); // ESRCH
-        }
+        let find_fn = crate::sym_must!(find_task_by_vpid);
+        find_fn(pid as i32)
     };
     if task.is_null() {
         return Err(-3); // ESRCH
     }
 
     let mm = unsafe {
-        if let Some(get_mm_fn) = crate::sym!(get_task_mm) {
-            get_mm_fn(task)
-        } else {
-            return Err(-14); // EFAULT
-        }
+        let get_mm_fn = crate::sym_must!(get_task_mm);
+        get_mm_fn(task)
     };
     if mm.is_null() {
         return Err(-14); // EFAULT
@@ -207,9 +199,8 @@ pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64)
     let pgd_va = unsafe { *pgd_addr };
     if pgd_va == 0 {
         unsafe {
-            if let Some(mmput_fn) = crate::sym!(mmput) {
-                mmput_fn(mm);
-            }
+            let mmput_fn = crate::sym_must!(mmput);
+            mmput_fn(mm);
         }
         return Err(-14);
     }
@@ -316,9 +307,8 @@ pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64)
     }
 
     unsafe {
-        if let Some(mmput_fn) = crate::sym!(mmput) {
-            mmput_fn(mm);
-        }
+        let mmput_fn = crate::sym_must!(mmput);
+        mmput_fn(mm);
     }
 
     Ok(total_copied)
@@ -327,22 +317,16 @@ pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64)
 /// 从一个用户态源虚拟地址，安全写入指定进程的虚拟内存中（零拷贝直接写入，支持PTE缓存）
 pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64) -> Result<usize, i32> {
     let task = unsafe {
-        if let Some(find_fn) = crate::sym!(find_task_by_vpid) {
-            find_fn(pid as i32)
-        } else {
-            return Err(-3); // ESRCH
-        }
+        let find_fn = crate::sym_must!(find_task_by_vpid);
+        find_fn(pid as i32)
     };
     if task.is_null() {
         return Err(-3); // ESRCH
     }
 
     let mm = unsafe {
-        if let Some(get_mm_fn) = crate::sym!(get_task_mm) {
-            get_mm_fn(task)
-        } else {
-            return Err(-14); // EFAULT
-        }
+        let get_mm_fn = crate::sym_must!(get_task_mm);
+        get_mm_fn(task)
     };
     if mm.is_null() {
         return Err(-14); // EFAULT
@@ -353,9 +337,8 @@ pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64)
     let pgd_va = unsafe { *pgd_addr };
     if pgd_va == 0 {
         unsafe {
-            if let Some(mmput_fn) = crate::sym!(mmput) {
-                mmput_fn(mm);
-            }
+            let mmput_fn = crate::sym_must!(mmput);
+            mmput_fn(mm);
         }
         return Err(-14);
     }
@@ -448,9 +431,8 @@ pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64)
     }
 
     unsafe {
-        if let Some(mmput_fn) = crate::sym!(mmput) {
-            mmput_fn(mm);
-        }
+        let mmput_fn = crate::sym_must!(mmput);
+        mmput_fn(mm);
     }
 
     Ok(total_copied)

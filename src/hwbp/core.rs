@@ -249,9 +249,8 @@ pub unsafe extern "C" fn recovery_bp_work_func(work: *mut WorkStruct) {
     
     // 递减工作项继承的引用计数。如果是最后一个扣减引用的，则物理释放资源。
     if (*node).refcnt.fetch_sub(1, Ordering::Release) == 1 {
-        if let Some(free_fn) = crate::sym!(kfree) {
-            free_fn(node as *const c_void);
-        }
+        let free_fn = crate::sym_must!(kfree);
+        free_fn(node as *const c_void);
         IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -322,9 +321,8 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
 
     // 递减注册占用引用。如果是最后一个扣减引用的，则物理释放资源。
     if (*node).refcnt.fetch_sub(1, Ordering::Release) == 1 {
-        if let Some(free_fn) = crate::sym!(kfree) {
-            free_fn(node as *const c_void);
-        }
+        let free_fn = crate::sym_must!(kfree);
+        free_fn(node as *const c_void);
         IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -373,11 +371,8 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
         let node = (curr as usize - node_offset) as *mut HwbpNode;
         if unsafe { (*node).scheme == 2 } {
             let task = get_current();
-            let tgid = if let Some(pid_fn) = crate::sym!(__task_pid_nr_ns) {
-                pid_fn(task, 1, core::ptr::null_mut()) as u32
-            } else {
-                0
-            };
+            let pid_fn = crate::sym_must!(__task_pid_nr_ns);
+            let tgid = pid_fn(task, 1, core::ptr::null_mut()) as u32;
             if unsafe { (*node).pid == tgid && (*node).active.load(Ordering::Acquire) } {
                 let hw_addr = calc_hw_addr((*node).addr, (*node).bp_type, (*node).len);
                 if (addr & !7u64) == hw_addr {
@@ -427,9 +422,8 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
             crate::sync::smp_wmb(); // 屏障以确保 seq 改变在写入数据前可见
 
             let task = get_current();
-            if let Some(pid_fn) = crate::sym!(__task_pid_nr_ns) {
-                rec.task_id = pid_fn(task, 0, core::ptr::null_mut()) as u32;
-            }
+            let pid_fn = crate::sym_must!(__task_pid_nr_ns);
+            rec.task_id = pid_fn(task, 0, core::ptr::null_mut()) as u32;
             rec.hit_addr = (*found_node).addr;
             let regs_ref = &*regs;
             rec.regs_info.pc = regs_ref.pc;
@@ -462,9 +456,8 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
         // 递减引用计数（如果未成功转移给工作队列）
         if !ref_transferred {
             if (*found_node).refcnt.fetch_sub(1, Ordering::Release) == 1 {
-                if let Some(free_fn) = crate::sym!(kfree) {
-                    free_fn(found_node as *const c_void);
-                }
+                let free_fn = crate::sym_must!(kfree);
+                free_fn(found_node as *const c_void);
                 IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             }
         }
@@ -521,9 +514,8 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
         crate::sync::smp_wmb(); // 屏障以确保 seq 改变在写入数据前可见
 
         let task = unsafe { get_current() };
-        if let Some(pid_fn) = crate::sym!(__task_pid_nr_ns) {
-            rec.task_id = pid_fn(task, 0, core::ptr::null_mut()) as u32;
-        }
+        let pid_fn = crate::sym_must!(__task_pid_nr_ns);
+        rec.task_id = pid_fn(task, 0, core::ptr::null_mut()) as u32;
         rec.hit_addr = unsafe { (*found_node).addr };
         let pt_regs_ref = unsafe { &*pt_regs };
         rec.regs_info.pc = pt_regs_ref.pc;
@@ -609,9 +601,8 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
     if !ref_transferred {
         unsafe {
             if (*found_node).refcnt.fetch_sub(1, Ordering::Release) == 1 {
-                if let Some(free_fn) = crate::sym!(kfree) {
-                    free_fn(found_node as *const c_void);
-                }
+                let free_fn = crate::sym_must!(kfree);
+                free_fn(found_node as *const c_void);
                 IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             }
         }
@@ -705,14 +696,14 @@ pub fn register_hwbp(
     if scheme == 2 {
         unsafe {
             // 延迟加载 watchpoint hook
-            let install_fn: Option<unsafe extern "C" fn()> = crate::ffi::lookup_sym("watchpoint_handler_install_hook_helper"); 
+            let install_fn = crate::sym!(watchpoint_handler_install_hook_helper); 
             if let Some(install) = install_fn {
                 install();
             } else {
                 crate::hooks::watchpoint::install_wp_hook(before_watchpoint_handler as *const c_void);
             }
 
-            let malloc_fn = crate::sym!(__kmalloc).ok_or(-38)?;
+            let malloc_fn = crate::sym_must!(kmalloc);
             let node_ptr = malloc_fn(core::mem::size_of::<HwbpNode>(), 0x20u32) as *mut HwbpNode; // GFP_ATOMIC
             if node_ptr.is_null() {
                 return Err(-12); // ENOMEM
@@ -750,7 +741,7 @@ pub fn register_hwbp(
     }
 
     let task = unsafe {
-        let find_fn = crate::sym!(find_task_by_vpid).ok_or(-3)?; // ESRCH
+        let find_fn = crate::sym_must!(find_task_by_vpid);
         let task_ptr = find_fn(pid as i32);
         if task_ptr.is_null() {
             return Err(-3);
@@ -780,7 +771,7 @@ pub fn register_hwbp(
             return Err(bp_err as i32);
         }
 
-        let malloc_fn = crate::sym!(__kmalloc).ok_or(-38)?;
+        let malloc_fn = crate::sym_must!(kmalloc);
         let node_ptr = malloc_fn(core::mem::size_of::<HwbpNode>(), 0x20u32) as *mut HwbpNode;
         if node_ptr.is_null() {
             if let Some(unreg_fn) = crate::sym!(unregister_hw_breakpoint) {
@@ -933,7 +924,7 @@ pub fn read_hwbp_info(
     }
 
     // 动态分配 16 个记录的堆空间，消除内核栈溢出隐患（约 4.6KB）
-    let malloc_fn = crate::sym!(__kmalloc).ok_or(-38)?;
+    let malloc_fn = crate::sym_must!(kmalloc);
     let temp_records_ptr = unsafe {
         malloc_fn(
             16 * core::mem::size_of::<HwbpHitRecord>(),
@@ -948,9 +939,8 @@ pub fn read_hwbp_info(
     impl Drop for TempRecordsGuard {
         fn drop(&mut self) {
             if !self.0.is_null() {
-                if let Some(free_fn) = crate::sym!(kfree) {
-                    unsafe { free_fn(self.0 as *const c_void); }
-                }
+                let free_fn = crate::sym_must!(kfree);
+                unsafe { free_fn(self.0 as *const c_void); }
             }
         }
     }

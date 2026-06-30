@@ -259,6 +259,10 @@ pub struct KernelSymbols {
     pub rcu_read_lock: Option<unsafe extern "C" fn()>,
     pub rcu_read_unlock: Option<unsafe extern "C" fn()>,
 
+    // Watchpoint Hook 延迟加载相关
+    pub watchpoint_handler_install_hook_helper: Option<unsafe extern "C" fn()>,
+    pub watchpoint_handler: Option<*mut c_void>,
+
     // 工作队列和页信息 - 直接存储类型（不使用 Option），通过 null/0 判断
     pub system_wq: *mut c_void,
     pub page_size: i64,
@@ -304,6 +308,8 @@ pub static mut SYMS: KernelSymbols = KernelSymbols {
     synchronize_rcu: None,
     rcu_read_lock: None,
     rcu_read_unlock: None,
+    watchpoint_handler_install_hook_helper: None,
+    watchpoint_handler: None,
     system_wq: core::ptr::null_mut(),
     page_size: 0,
     page_shift: 0,
@@ -311,6 +317,25 @@ pub static mut SYMS: KernelSymbols = KernelSymbols {
     memstart_addr_val: 0,
     page_offset_val: 0,
 };
+
+pub struct MandatorySymbols {
+    pub kmalloc: unsafe extern "C" fn(size: usize, flags: u32) -> *mut c_void,
+    pub kfree: unsafe extern "C" fn(obj: *const c_void),
+    pub mmput: unsafe extern "C" fn(mm: *mut c_void) -> c_int,
+    pub get_task_mm: unsafe extern "C" fn(tsk: *mut c_void) -> *mut c_void,
+    pub find_task_by_vpid: unsafe extern "C" fn(pid: i32) -> *mut c_void,
+    pub __task_pid_nr_ns: unsafe extern "C" fn(tsk: *mut c_void, pid_type: c_int, ns: *mut c_void) -> i32,
+    pub _raw_spin_lock_irqsave: unsafe extern "C" fn(lock: *mut c_void) -> usize,
+    pub _raw_spin_unlock_irqrestore: unsafe extern "C" fn(lock: *mut c_void, flags: usize),
+    pub __arch_copy_to_user: unsafe extern "C" fn(to: *mut c_void, from: *const c_void, n: u64) -> u64,
+    pub __arch_copy_from_user: unsafe extern "C" fn(to: *mut c_void, from: *const c_void, n: u64) -> u64,
+    pub access_process_vm: unsafe extern "C" fn(tsk: *mut c_void, addr: u64, buf: *mut c_void, len: c_int, gup_flags: u32) -> c_int,
+}
+
+pub struct MandatorySymbolsWrapper(pub core::cell::UnsafeCell<Option<MandatorySymbols>>);
+unsafe impl Sync for MandatorySymbolsWrapper {}
+
+pub static M_SYMS: MandatorySymbolsWrapper = MandatorySymbolsWrapper(core::cell::UnsafeCell::new(None));
 
 /// 通过内核导出的 kallsyms_lookup_name，在运行时动态解析符号地址
 pub unsafe fn lookup_sym<T>(name: &str) -> Option<T> {
@@ -389,6 +414,9 @@ pub unsafe fn init_symbols() -> Result<(), i32> {
     (*syms_ptr).rcu_read_unlock = lookup_sym("rcu_read_unlock")
         .or_else(|| lookup_sym("__rcu_read_unlock"));
 
+    (*syms_ptr).watchpoint_handler_install_hook_helper = lookup_sym("watchpoint_handler_install_hook_helper");
+    (*syms_ptr).watchpoint_handler = lookup_sym("watchpoint_handler");
+
     let system_wq_sym: Option<*mut *mut c_void> = lookup_sym("system_wq");
     if let Some(sym) = system_wq_sym {
         (*syms_ptr).system_wq = *sym;
@@ -419,6 +447,21 @@ pub unsafe fn init_symbols() -> Result<(), i32> {
     } else {
         return Err(-2);
     }
+
+    let m_syms = MandatorySymbols {
+        kmalloc: (*syms_ptr).__kmalloc.ok_or(-2)?,
+        kfree: (*syms_ptr).kfree.ok_or(-2)?,
+        mmput: (*syms_ptr).mmput.ok_or(-2)?,
+        get_task_mm: (*syms_ptr).get_task_mm.ok_or(-2)?,
+        find_task_by_vpid: (*syms_ptr).find_task_by_vpid.ok_or(-2)?,
+        __task_pid_nr_ns: (*syms_ptr).__task_pid_nr_ns.ok_or(-2)?,
+        _raw_spin_lock_irqsave: (*syms_ptr)._raw_spin_lock_irqsave.ok_or(-2)?,
+        _raw_spin_unlock_irqrestore: (*syms_ptr)._raw_spin_unlock_irqrestore.ok_or(-2)?,
+        __arch_copy_to_user: (*syms_ptr).__arch_copy_to_user.ok_or(-2)?,
+        __arch_copy_from_user: (*syms_ptr).__arch_copy_from_user.ok_or(-2)?,
+        access_process_vm: (*syms_ptr).access_process_vm.ok_or(-2)?,
+    };
+    *M_SYMS.0.get() = Some(m_syms);
 
     Ok(())
 }

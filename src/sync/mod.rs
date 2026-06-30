@@ -23,11 +23,10 @@ impl RawSpinlock {
 
     /// 获取自旋锁，会关中断并保存当前中断标志
     pub fn lock(&self) -> SpinlockGuard<'_> {
-        let mut flags = 0usize;
+        let flags: usize;
         unsafe {
-            if let Some(lock_fn) = crate::sym!(_raw_spin_lock_irqsave) {
-                flags = lock_fn(self as *const RawSpinlock as *mut _);
-            }
+            let lock_fn = crate::sym_must!(_raw_spin_lock_irqsave);
+            flags = lock_fn(self as *const RawSpinlock as *mut _);
         }
         SpinlockGuard { lock: self, flags }
     }
@@ -42,9 +41,8 @@ pub struct SpinlockGuard<'a> {
 impl<'a> Drop for SpinlockGuard<'a> {
     fn drop(&mut self) {
         unsafe {
-            if let Some(unlock_fn) = crate::sym!(_raw_spin_unlock_irqrestore) {
-                unlock_fn(self.lock as *const RawSpinlock as *mut _, self.flags);
-            }
+            let unlock_fn = crate::sym_must!(_raw_spin_unlock_irqrestore);
+            unlock_fn(self.lock as *const RawSpinlock as *mut _, self.flags);
         }
     }
 }
