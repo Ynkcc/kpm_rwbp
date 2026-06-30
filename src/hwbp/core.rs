@@ -155,16 +155,16 @@ macro_rules! write_sysreg {
     };
 }
 
-#[inline(always)] pub unsafe fn read_wcr(n: i32) -> u64 { read_sysreg!(dbgwcr, n) }
-#[inline(always)] pub unsafe fn write_wcr(n: i32, val: u64) { write_sysreg!(dbgwcr, n, val); }
-#[inline(always)] unsafe fn read_wvr(n: i32) -> u64 { read_sysreg!(dbgwvr, n) }
-#[inline(always)] unsafe fn write_wvr(n: i32, val: u64) { write_sysreg!(dbgwvr, n, val); }
-#[inline(always)] unsafe fn read_bcr(n: i32) -> u64 { read_sysreg!(dbgbcr, n) }
-#[inline(always)] unsafe fn write_bcr(n: i32, val: u64) { write_sysreg!(dbgbcr, n, val); }
-#[inline(always)] unsafe fn read_bvr(n: i32) -> u64 { read_sysreg!(dbgbvr, n) }
-#[inline(always)] unsafe fn write_bvr(n: i32, val: u64) { write_sysreg!(dbgbvr, n, val); }
+#[inline(always)] pub unsafe fn read_wcr(n: i32) -> u64 { unsafe { read_sysreg!(dbgwcr, n) }}
+#[inline(always)] pub unsafe fn write_wcr(n: i32, val: u64) { unsafe { write_sysreg!(dbgwcr, n, val); }}
+#[inline(always)] unsafe fn read_wvr(n: i32) -> u64 { unsafe { read_sysreg!(dbgwvr, n) }}
+#[inline(always)] unsafe fn write_wvr(n: i32, val: u64) { unsafe { write_sysreg!(dbgwvr, n, val); }}
+#[inline(always)] unsafe fn read_bcr(n: i32) -> u64 { unsafe { read_sysreg!(dbgbcr, n) }}
+#[inline(always)] unsafe fn write_bcr(n: i32, val: u64) { unsafe { write_sysreg!(dbgbcr, n, val); }}
+#[inline(always)] unsafe fn read_bvr(n: i32) -> u64 { unsafe { read_sysreg!(dbgbvr, n) }}
+#[inline(always)] unsafe fn write_bvr(n: i32, val: u64) { unsafe { write_sysreg!(dbgbvr, n, val); }}
 
-unsafe fn read_wb_reg(reg_idx: i32, n: i32) -> u64 {
+unsafe fn read_wb_reg(reg_idx: i32, n: i32) -> u64 { unsafe {
     if reg_idx == 0 { // DBG_REG_BVR
         read_bvr(n)
     } else if reg_idx == 16 { // DBG_REG_BCR
@@ -176,9 +176,9 @@ unsafe fn read_wb_reg(reg_idx: i32, n: i32) -> u64 {
     } else {
         0
     }
-}
+}}
 
-unsafe fn write_wb_reg(reg_idx: i32, n: i32, val: u64) {
+unsafe fn write_wb_reg(reg_idx: i32, n: i32, val: u64) { unsafe {
     if reg_idx == 0 {
         write_bvr(n, val);
     } else if reg_idx == 16 {
@@ -188,7 +188,7 @@ unsafe fn write_wb_reg(reg_idx: i32, n: i32, val: u64) {
     } else if reg_idx == 48 {
         write_wcr(n, val);
     }
-}
+}}
 
 pub fn calc_hw_addr(bp_addr: u64, bp_type: u32, bp_len: u32) -> u64 {
     let alignment_mask = if bp_type == 4 {
@@ -208,7 +208,7 @@ unsafe fn toggle_bp_registers_directly(
     bp_type: u32,
     bp_len: u32,
     enable: bool,
-) -> bool {
+) -> bool { unsafe {
     let hw_addr = calc_hw_addr(bp_addr, bp_type, bp_len);
     let (ctrl_reg, val_reg, max_slots) = if bp_type == 4 {
         (16, 0, 6) // BCR, BVR
@@ -232,10 +232,10 @@ unsafe fn toggle_bp_registers_directly(
     }
     pr_warn!("toggle_bp_registers_directly: 未找到匹配地址 0x{:x} 的插槽！", hw_addr);
     false
-}
+}}
 
 /// 临时失效期满后，恢复硬件断点
-pub unsafe extern "C" fn recovery_bp_work_func(work: *mut WorkStruct) {
+pub unsafe extern "C" fn recovery_bp_work_func(work: *mut WorkStruct) { unsafe {
     let node_offset = core::mem::offset_of!(HwbpNode, recovery_work);
     let node = (work as usize - node_offset) as *mut HwbpNode;
     pr_info!("recovery_bp_work_func: 恢复断点 {:p}, 方案 {}", (*node).bp, (*node).scheme);
@@ -259,9 +259,9 @@ pub unsafe extern "C" fn recovery_bp_work_func(work: *mut WorkStruct) {
     
     // 递减工作项继承的引用计数。利用 KernelArc 的 Drop 自动进行物理释放与计数管理。
     let _arc = KernelArc::from_raw_transferred(node);
-}
+}}
 
-pub unsafe extern "C" fn write_wp_regs_on_cpu(info: *mut c_void) {
+pub unsafe extern "C" fn write_wp_regs_on_cpu(info: *mut c_void) { unsafe {
     let node = info as *mut HwbpNode;
     let hw_addr = calc_hw_addr((*node).addr, (*node).bp_type, (*node).len);
     write_wb_reg(32, 0, hw_addr); // WVR0
@@ -274,14 +274,14 @@ pub unsafe extern "C" fn write_wp_regs_on_cpu(info: *mut c_void) {
     mdscr |= 1u64 << 15;
     core::arch::asm!("msr mdscr_el1, {}", in(reg) mdscr);
     core::arch::asm!("isb");
-}
+}}
 
-unsafe extern "C" fn disable_wp_regs_on_cpu(_info: *mut c_void) {
+unsafe extern "C" fn disable_wp_regs_on_cpu(_info: *mut c_void) { unsafe {
     write_wb_reg(48, 0, 0); // WCR0
     write_wb_reg(32, 0, 0); // WVR0
-}
+}}
 
-unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
+unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) { unsafe {
     let node_offset = core::mem::offset_of!(HwbpNode, unreg_work);
     let node = (work as usize - node_offset) as *mut HwbpNode;
 
@@ -332,7 +332,7 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
 
     // 3. 释放注册占用引用（即当前注销工作本身持有的强引用所有权）。离开作用域时自动物理释放（如引用为0）。
     let _arc = KernelArc::from_raw_transferred(node);
-}
+}}
 
 /// ARM64 处理器寄存器布局
 #[repr(C)]
@@ -362,7 +362,7 @@ pub struct HookLocal {
 }
 
 /// Scheme 3 watchpoint 拦截钩子回调函数（公开供 hooks 模块在卸载时使用）
-pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata: *mut c_void) {
+pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata: *mut c_void) { unsafe {
     let addr = (*args).arg0;
     let regs = (*args).arg2 as *mut PtRegs;
     let mut found_node: *mut HwbpNode = core::ptr::null_mut();
@@ -465,10 +465,10 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
             let _ = KernelArc::from_raw_transferred(found_node);
         }
     }
-}
+}}
 
 /// 硬件调试断点（perf_event）触发的回调函数
-unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *mut c_void) {
+unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *mut c_void) { unsafe {
     let pt_regs = regs as *mut PtRegs;
     pr_info!("hwbp_triggered 触发! bp={:p}", bp);
 
@@ -606,7 +606,7 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
             let _ = KernelArc::from_raw_transferred(found_node);
         }
     }
-}
+}}
 
 #[allow(dead_code)]
 unsafe fn arm64_move_bp_to_next_instruction(
@@ -614,7 +614,7 @@ unsafe fn arm64_move_bp_to_next_instruction(
     next_instruction_addr: u64,
     original_attr: &mut PerfEventAttr,
     next_instruction_attr: &mut PerfEventAttr,
-) -> bool {
+) -> bool { unsafe {
     if bp.is_null() || next_instruction_addr == 0 {
         return false;
     }
@@ -636,14 +636,14 @@ unsafe fn arm64_move_bp_to_next_instruction(
     }
     next_instruction_attr.bp_addr = 0;
     false
-}
+}}
 
 #[allow(dead_code)]
 unsafe fn arm64_recovery_bp_to_original(
     bp: *mut c_void,
     original_attr: &mut PerfEventAttr,
     next_instruction_attr: &mut PerfEventAttr,
-) -> bool {
+) -> bool { unsafe {
     if bp.is_null() {
         return false;
     }
@@ -655,7 +655,7 @@ unsafe fn arm64_recovery_bp_to_original(
         }
     }
     false
-}
+}}
 
 /// 注册一个进程硬件断点
 pub fn register_hwbp(

@@ -161,7 +161,7 @@ unsafe extern "C" {
 /// KP 导出的 printk 是函数指针变量的地址，不是函数地址
 /// 注意：printk 是可变参数函数，我们使用 extern "C" 声明来支持可变参数
 #[inline(always)]
-pub unsafe fn printk(fmt: *const u8) -> c_int {
+pub unsafe fn printk(fmt: *const u8) -> c_int { unsafe {
     // 解引用函数指针变量获取实际的 printk 函数地址
     let printk_addr = printk_ptr;
     // 使用函数指针类型来调用
@@ -169,16 +169,16 @@ pub unsafe fn printk(fmt: *const u8) -> c_int {
     // 只传递 fmt 参数，其他参数由调用者在格式化字符串中处理
     let printk_fn: extern "C" fn(*const u8) -> c_int = core::mem::transmute(printk_addr);
     printk_fn(fmt)
-}
+}}
 
 /// 调用 kallsyms_lookup_name 函数（需要解引用 KP 导出的函数指针变量）
 #[inline(always)]
-pub unsafe fn kallsyms_lookup_name(name: *const c_char) -> core::ffi::c_ulong {
+pub unsafe fn kallsyms_lookup_name(name: *const c_char) -> core::ffi::c_ulong { unsafe {
     // 解引用函数指针变量获取实际的函数地址
     let kallsyms_addr = kallsyms_lookup_name_ptr;
     let kallsyms_fn: extern "C" fn(*const c_char) -> core::ffi::c_ulong = core::mem::transmute(kallsyms_addr);
     kallsyms_fn(name)
-}
+}}
 
 // =============================================================================
 // 需要运行时查找的内核 API 符号（kfunc 或内核标准导出）
@@ -339,7 +339,7 @@ unsafe impl Sync for MandatorySymbolsWrapper {}
 pub static M_SYMS: MandatorySymbolsWrapper = MandatorySymbolsWrapper(core::cell::UnsafeCell::new(None));
 
 /// 通过内核导出的 kallsyms_lookup_name，在运行时动态解析符号地址
-pub unsafe fn lookup_sym<T>(name: &str) -> Option<T> {
+pub unsafe fn lookup_sym<T>(name: &str) -> Option<T> { unsafe {
     let mut name_buf = [0u8; 128];
     if name.len() >= name_buf.len() {
         return None;
@@ -351,11 +351,11 @@ pub unsafe fn lookup_sym<T>(name: &str) -> Option<T> {
     } else {
         Some(core::mem::transmute_copy(&addr))
     }
-}
+}}
 
 /// 初始化需要运行时查找的内核符号
 /// KP 核心导出的符号已通过 extern 声明直接链接，无需此步
-pub unsafe fn init_symbols() -> Result<(), Error> {
+pub unsafe fn init_symbols() -> Result<(), Error> { unsafe {
     let syms_ptr = core::ptr::addr_of_mut!(SYMS);
 
     (*syms_ptr).__kmalloc = lookup_sym("__kmalloc")
@@ -459,4 +459,4 @@ pub unsafe fn init_symbols() -> Result<(), Error> {
     *M_SYMS.0.get() = Some(m_syms);
 
     Ok(())
-}
+}}

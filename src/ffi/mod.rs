@@ -74,8 +74,8 @@ pub type HookFargs3 = hook_fargs4_t;
 
 /// 读取当前 CPU core 的 sp_el0 寄存器，用于快速定位当前 task_struct 指针
 #[inline(always)]
-pub unsafe fn get_current() -> *mut c_void {
+pub unsafe fn get_current() -> *mut c_void { unsafe {
     let sp_el0: u64;
     core::arch::asm!("mrs {}, sp_el0", out(reg) sp_el0);
     sp_el0 as *mut c_void
-}
+}}

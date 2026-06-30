@@ -62,22 +62,22 @@ impl<T> KernelArc<T> {
     /// 
     /// # Safety
     /// 传入的指针必须是由 KernelArc 管理的内存中 data 字段的有效指针。
-    pub unsafe fn from_raw(ptr: *const T) -> Self {
+    pub unsafe fn from_raw(ptr: *const T) -> Self { unsafe {
         let inner_ptr = Self::inner_ptr_from_data_ptr(ptr);
         let non_null = NonNull::new_unchecked(inner_ptr);
         non_null.as_ref().refcnt.fetch_add(1, Ordering::Relaxed);
         Self { ptr: non_null }
-    }
+    }}
 
     /// 从内部数据的裸指针重新构造一个 KernelArc，但是【不】递增引用计数，用于所有权的流转。
     /// 
     /// # Safety
     /// 传入的指针必须是由 KernelArc 管理的内存中 data 字段的有效指针，且调用方需要将
     /// 该上下文原本对该引用的所有权交付给返回的 KernelArc 管理。
-    pub unsafe fn from_raw_transferred(ptr: *const T) -> Self {
+    pub unsafe fn from_raw_transferred(ptr: *const T) -> Self { unsafe {
         let inner_ptr = Self::inner_ptr_from_data_ptr(ptr);
         Self { ptr: NonNull::new_unchecked(inner_ptr) }
-    }
+    }}
 
     /// 消费当前的 KernelArc，返回内部数据的裸指针，【不】递减引用计数（所有权转移给裸指针上下文）。
     pub fn into_raw(self) -> *mut T {

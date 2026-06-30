@@ -9,7 +9,7 @@ pub static CURRENT_CONTROL_TGID: AtomicU64 = AtomicU64::new(0);
 
 // Syscall 参数提取辅助函数
 #[inline(always)]
-pub unsafe fn get_syscall_arg(hook_fargs: *mut c_void, n: usize) -> u64 {
+pub unsafe fn get_syscall_arg(hook_fargs: *mut c_void, n: usize) -> u64 { unsafe {
     let fargs = hook_fargs as *mut HookFargs0;
     if crate::ffi::has_syscall_wrapper != 0 {
         let pt_regs = (*fargs).args[0] as *const crate::hwbp::core::PtRegs;
@@ -21,19 +21,19 @@ pub unsafe fn get_syscall_arg(hook_fargs: *mut c_void, n: usize) -> u64 {
     } else {
         (*fargs).args[n]
     }
-}
+}}
 
 #[inline(always)]
-pub unsafe fn syscall_set_retval(hook_fargs: *mut c_void, val: u64) {
+pub unsafe fn syscall_set_retval(hook_fargs: *mut c_void, val: u64) { unsafe {
     let fargs = hook_fargs as *mut HookFargs0;
     (*fargs).ret = val;
-}
+}}
 
 #[inline(always)]
-pub unsafe fn syscall_set_handled(hook_fargs: *mut c_void, handled: bool) {
+pub unsafe fn syscall_set_handled(hook_fargs: *mut c_void, handled: bool) { unsafe {
     let fargs = hook_fargs as *mut HookFargs0;
     (*fargs).skip_origin = if handled { 1 } else { 0 };
-}
+}}
 
 pub unsafe fn handle_cleanup() {
     pr_info!("控制端进程已退出，开始自动清理内核资源...");
@@ -42,7 +42,7 @@ pub unsafe fn handle_cleanup() {
 }
 
 // __NR_fstatfs (44) 系统调用拦截 Hook
-pub unsafe extern "C" fn rwbp_fstatfs_hook(args: *mut crate::ffi::hook_fargs4_t, _udata: *mut c_void) {
+pub unsafe extern "C" fn rwbp_fstatfs_hook(args: *mut crate::ffi::hook_fargs4_t, _udata: *mut c_void) { unsafe {
     let arg0 = get_syscall_arg(args as *mut c_void, 0);
     let arg1 = get_syscall_arg(args as *mut c_void, 1);
 
@@ -156,10 +156,10 @@ pub unsafe extern "C" fn rwbp_fstatfs_hook(args: *mut crate::ffi::hook_fargs4_t,
 
     syscall_set_retval(args as *mut c_void, ret as u64);
     syscall_set_handled(args as *mut c_void, true);
-}
+}}
 
 // __NR_exit_group (94) 系统调用拦截 Hook，在控制进程退出时清理资源
-pub unsafe extern "C" fn rwbp_exit_group_hook(_args: *mut crate::ffi::hook_fargs4_t, _udata: *mut c_void) {
+pub unsafe extern "C" fn rwbp_exit_group_hook(_args: *mut crate::ffi::hook_fargs4_t, _udata: *mut c_void) { unsafe {
     let current = get_current();
     let tgid = *( (current as usize + crate::ffi::task_struct_offset.tgid_offset as usize) as *const u32 );
     let ctrl_tgid = CURRENT_CONTROL_TGID.load(Ordering::SeqCst);
@@ -167,4 +167,4 @@ pub unsafe extern "C" fn rwbp_exit_group_hook(_args: *mut crate::ffi::hook_fargs
         handle_cleanup();
         CURRENT_CONTROL_TGID.store(0, Ordering::SeqCst);
     }
-}
+}}

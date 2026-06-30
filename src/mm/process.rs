@@ -82,7 +82,7 @@ impl Arm64Paging {
     }
 }
 
-pub unsafe fn pgtable_phys(pgd_va: u64, va: u64) -> u64 {
+pub unsafe fn pgtable_phys(pgd_va: u64, va: u64) -> u64 { unsafe {
     let paging = Arm64Paging::new();
     let pxd_bits = paging.pxd_bits;
     let pxd_ptrs = paging.pxd_ptrs;
@@ -118,7 +118,7 @@ pub unsafe fn pgtable_phys(pgd_va: u64, va: u64) -> u64 {
     } else {
         0
     }
-}
+}}
 
 #[derive(Clone, Copy)]
 struct PmdWalkResult {
@@ -128,7 +128,7 @@ struct PmdWalkResult {
     block_phys_base: u64,
 }
 
-unsafe fn walk_to_pmd(pgd_va: u64, va: u64, paging: &Arm64Paging) -> PmdWalkResult {
+unsafe fn walk_to_pmd(pgd_va: u64, va: u64, paging: &Arm64Paging) -> PmdWalkResult { unsafe {
     let pxd_bits = paging.pxd_bits;
     let pxd_ptrs = paging.pxd_ptrs;
     let mut cur_pxd_va = pgd_va;
@@ -175,7 +175,7 @@ unsafe fn walk_to_pmd(pgd_va: u64, va: u64, paging: &Arm64Paging) -> PmdWalkResu
         pte_table_va: 0,
         block_phys_base: 0,
     }
-}
+}}
 
 /// 读取指定进程的用户虚拟内存数据，并安全写入另一个用户态虚拟地址（零拷贝直接读取，支持PTE缓存）
 pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64) -> Result<usize, Error> {

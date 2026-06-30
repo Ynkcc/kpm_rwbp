@@ -7,7 +7,7 @@ use crate::utils::Error;
 use core::ffi::c_void;
 use zerocopy::FromBytes;
 
-pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
+pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 { unsafe {
     if shm.is_null() || (*shm).magic != SHM_MAGIC {
         pr_warn!("rwbp_dispatch: 无效的共享内存魔数或空指针！");
         return Error::EINVAL as i64;
@@ -127,4 +127,4 @@ pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
             Error::EINVAL as i64
         }
     }
-}
+}}

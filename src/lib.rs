@@ -1,7 +1,6 @@
 #![no_std]
 #![no_main]
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(unused_unsafe)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 // 提供编译器需要的符号（内核会在运行时提供实际实现）
 #[unsafe(no_mangle)]
@@ -15,7 +14,7 @@ pub extern "C" fn memcmp(_a: *const u8, _b: *const u8, _n: usize) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 { unsafe {
     if dest.is_null() || src.is_null() || n == 0 {
         return dest;
     }
@@ -29,7 +28,7 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mu
         }
     }
     dest
-}
+}}
 
 #[macro_use]
 pub mod macros;
@@ -88,88 +87,88 @@ pub static mut __kpm_exitcall_rwbp_exit: unsafe extern "C" fn(*mut c_void) -> i6
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text")]
 pub unsafe extern "C" fn rwbp_init(_args: *const u8, _event: *const u8, _reserved: *mut c_void) -> i64 {
-    pr_info!("kpm_RWBP 模块初始化中...");
+    unsafe {
+        pr_info!("kpm_RWBP 模块初始化中...");
 
-    // 初始化全局硬件断点管理链表，防止空指针解引用引发内核崩溃
-    let bp_list_ptr = crate::hwbp::core::BP_LIST.get_ptr();
-    (*bp_list_ptr).init();
+        // 初始化全局硬件断点管理链表，防止空指针解引用引发内核崩溃
+        let bp_list_ptr = crate::hwbp::core::BP_LIST.get_ptr();
+        (*bp_list_ptr).init();
 
-    // 初始化内核符号
-    if let Err(e) = crate::ffi::init_symbols() {
-        pr_err!("初始化内核符号失败: {}", e);
-        return e as i64;
+        // 初始化内核符号
+        if let Err(e) = crate::ffi::init_symbols() {
+            pr_err!("初始化内核符号失败: {}", e);
+            return e as i64;
+        }
+
+        // 初始化全局自旋锁，安全兼容 Debug 内核
+        crate::hwbp::core::BP_LIST_LOCK.init();
+
+        // 挂钩系统调用
+        let ret_fstatfs = crate::ffi::hook_syscalln(
+            44, // __NR_fstatfs
+            3,  // narg
+            crate::hooks::syscall::rwbp_fstatfs_hook as *const c_void,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+        );
+        pr_info!("hook_syscalln fstatfs 返回: {}", ret_fstatfs);
+
+        let ret_exit_group = crate::ffi::hook_syscalln(
+            94, // __NR_exit_group
+            1,  // narg
+            crate::hooks::syscall::rwbp_exit_group_hook as *const c_void,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+        );
+        pr_info!("hook_syscalln exit_group 返回: {}", ret_exit_group);
+
+        pr_info!("kpm_RWBP 初始化成功，系统调用 Hook 已就绪！");
+        0
     }
-
-    // 初始化全局自旋锁，安全兼容 Debug 内核
-    crate::hwbp::core::BP_LIST_LOCK.init();
-
-    // 挂钩系统调用
-    let ret_fstatfs = crate::ffi::hook_syscalln(
-        44, // __NR_fstatfs
-        3,  // narg
-        crate::hooks::syscall::rwbp_fstatfs_hook as *const c_void,
-        core::ptr::null(),
-        core::ptr::null_mut(),
-    );
-    pr_info!("hook_syscalln fstatfs 返回: {}", ret_fstatfs);
-
-    let ret_exit_group = crate::ffi::hook_syscalln(
-        94, // __NR_exit_group
-        1,  // narg
-        crate::hooks::syscall::rwbp_exit_group_hook as *const c_void,
-        core::ptr::null(),
-        core::ptr::null_mut(),
-    );
-    pr_info!("hook_syscalln exit_group 返回: {}", ret_exit_group);
-
-    pr_info!("kpm_RWBP 初始化成功，系统调用 Hook 已就绪！");
-    0
 }
 
 // KPM exit callback
 pub unsafe extern "C" fn rwbp_exit(_reserved: *mut c_void) -> i64 {
-    pr_info!("模块安全注销中...");
-
-    crate::ffi::unhook_syscalln(
-        44,
-        crate::hooks::syscall::rwbp_fstatfs_hook as *const c_void,
-        core::ptr::null(),
-    );
-    crate::ffi::unhook_syscalln(
-        94,
-        crate::hooks::syscall::rwbp_exit_group_hook as *const c_void,
-        core::ptr::null(),
-    );
-    crate::hooks::watchpoint::remove_wp_hook();
-
-    // 先注销和排队清理任务，触发 IN_FLIGHT 的递增和排队
-    crate::hooks::syscall::handle_cleanup();
-
-    // 先手动释放 KernelPatch 框架在 supercall 分发器中对本进程持有的 RCU 读锁，
-    // 从而避免在此后的 msleep 中触发 Warning，并且打破 synchronize_rcu 的死锁环，使清理工作项可以顺利运行并递减 IN_FLIGHT
     unsafe {
+        pr_info!("模块安全注销中...");
+
+        crate::ffi::unhook_syscalln(
+            44,
+            crate::hooks::syscall::rwbp_fstatfs_hook as *const c_void,
+            core::ptr::null(),
+        );
+        crate::ffi::unhook_syscalln(
+            94,
+            crate::hooks::syscall::rwbp_exit_group_hook as *const c_void,
+            core::ptr::null(),
+        );
+        crate::hooks::watchpoint::remove_wp_hook();
+
+        // 先注销和排队清理任务，触发 IN_FLIGHT 的递增和排队
+        crate::hooks::syscall::handle_cleanup();
+
+        // 先手动释放 KernelPatch 框架在 supercall 分发器中对本进程持有的 RCU 读锁，
+        // 从而避免在此后的 msleep 中触发 Warning，并且打破 synchronize_rcu 的死锁环，使清理工作项可以顺利运行并递减 IN_FLIGHT
         if let Some(rcu_read_unlock_fn) = crate::sym!(rcu_read_unlock) {
             rcu_read_unlock_fn();
         }
-    }
 
-    // 再循环等待所有在途的任务完全退空
-    while crate::hwbp::core::IN_FLIGHT.load(Ordering::SeqCst) > 0 {
-        pr_info!("模块注销等待中... 在途工作任务数: {}", crate::hwbp::core::IN_FLIGHT.load(Ordering::SeqCst));
-        if let Some(msleep_fn) = sym!(msleep) {
-            msleep_fn(10);
+        // 再循环等待所有在途的任务完全退空
+        while crate::hwbp::core::IN_FLIGHT.load(Ordering::SeqCst) > 0 {
+            pr_info!("模块注销等待中... 在途工作任务数: {}", crate::hwbp::core::IN_FLIGHT.load(Ordering::SeqCst));
+            if let Some(msleep_fn) = sym!(msleep) {
+                msleep_fn(10);
+            }
         }
-    }
 
-    // 重新获取 RCU 读锁，以满足 KernelPatch 卸载框架外层对 rcu_read_unlock() 的对称调用
-    unsafe {
+        // 重新获取 RCU 读锁，以满足 KernelPatch 卸载框架外层对 rcu_read_unlock() 的对称调用
         if let Some(rcu_read_lock_fn) = crate::sym!(rcu_read_lock) {
             rcu_read_lock_fn();
         }
-    }
 
-    pr_info!("模块已安全卸载...");
-    0
+        pr_info!("模块已安全卸载...");
+        0
+    }
 }
 
 #[panic_handler]
