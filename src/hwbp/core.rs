@@ -241,14 +241,18 @@ pub unsafe extern "C" fn recovery_bp_work_func(work: *mut WorkStruct) {
     pr_info!("recovery_bp_work_func: 恢复断点 {:p}, 方案 {}", (*node).bp, (*node).scheme);
 
     if (*node).active.load(Ordering::Acquire) {
-        if (*node).scheme == 2 {
-            if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
-                on_each_cpu(write_wp_regs_on_cpu, node as *mut c_void, 1);
+        match (*node).scheme {
+            2 => {
+                if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
+                    on_each_cpu(write_wp_regs_on_cpu, node as *mut c_void, 1);
+                }
             }
-        } else if !(*node).bp.is_null() {
-            if let Some(enable_fn) = crate::sym!(perf_event_enable) {
-                enable_fn((*node).bp);
+            1 => {
+                if let Some(enable_fn) = crate::sym!(perf_event_enable) {
+                    enable_fn((*node).bp);
+                }
             }
+            _ => {}
         }
     }
     (*node).is_temp_bp.store(false, Ordering::Release);
@@ -290,31 +294,35 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) {
         }
     }
 
-    if (*node).scheme == 2 {
-        let mut has_other_scheme3 = false;
-        let guard = BP_LIST_LOCK.lock();
-        let bp_list_ptr = BP_LIST.get_ptr();
-        let mut curr = (*bp_list_ptr).next;
-        while curr != bp_list_ptr {
-            let node_offset = core::mem::offset_of!(HwbpNode, list);
-            let other_node = (curr as usize - node_offset) as *mut HwbpNode;
-            if other_node != node && (*other_node).scheme == 2 && (*other_node).active.load(Ordering::Acquire) {
-                has_other_scheme3 = true;
-                break;
+    match (*node).scheme {
+        2 => {
+            let mut has_other_scheme3 = false;
+            let guard = BP_LIST_LOCK.lock();
+            let bp_list_ptr = BP_LIST.get_ptr();
+            let mut curr = (*bp_list_ptr).next;
+            while curr != bp_list_ptr {
+                let node_offset = core::mem::offset_of!(HwbpNode, list);
+                let other_node = (curr as usize - node_offset) as *mut HwbpNode;
+                if other_node != node && (*other_node).scheme == 2 && (*other_node).active.load(Ordering::Acquire) {
+                    has_other_scheme3 = true;
+                    break;
+                }
+                curr = (*curr).next;
             }
-            curr = (*curr).next;
-        }
-        drop(guard);
+            drop(guard);
 
-        if !has_other_scheme3 {
-            if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
-                on_each_cpu(disable_wp_regs_on_cpu, core::ptr::null_mut(), 1);
+            if !has_other_scheme3 {
+                if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
+                    on_each_cpu(disable_wp_regs_on_cpu, core::ptr::null_mut(), 1);
+                }
             }
         }
-    } else if !(*node).bp.is_null() {
-        if let Some(unreg_fn) = crate::sym!(unregister_hw_breakpoint) {
-            unreg_fn((*node).bp);
+        1 => {
+            if let Some(unreg_fn) = crate::sym!(unregister_hw_breakpoint) {
+                unreg_fn((*node).bp);
+            }
         }
+        _ => {}
     }
 
     // 2. 物理释放前调用 synchronize_rcu，确保所有核上当前的断点异常触发上下文彻底退出
@@ -674,115 +682,115 @@ pub fn register_hwbp(
     }
     drop(guard);
 
-    if scheme == 999 {
-        pr_err!("register_hwbp: 方案 999 已被废弃，直接返回错误");
-        return Err(Error::EINVAL);
-    }
-    if scheme != 1 && scheme != 2 {
-        pr_err!("register_hwbp: 不支持的方案 {}，仅支持方案 1 和 2", scheme);
-        return Err(Error::EINVAL);
-    }
-
-    if scheme == 2 {
-        unsafe {
-            let install_fn = crate::sym!(watchpoint_handler_install_hook_helper); 
-            if let Some(install) = install_fn {
-                install();
-            } else {
-                crate::hooks::watchpoint::install_wp_hook(before_watchpoint_handler as *const c_void);
-            }
-
-            let node: KernelArc<HwbpNode> = KernelArc::new_zeroed().map_err(|_| Error::ENOMEM)?;
-            let node_raw = node.as_raw();
-
-            (*node_raw).pid = pid;
-            (*node_raw).addr = addr;
-            (*node_raw).bp_type = bp_type;
-            (*node_raw).len = len;
-            (*node_raw).scheme = 2;
-            (*node_raw).active.store(true, Ordering::Release);
-            (*node_raw).recovery_work.init(recovery_bp_work_func);
-
-            let guard = BP_LIST_LOCK.lock();
-            let bp_list_ptr = BP_LIST.get_ptr();
-            (*bp_list_ptr).add_rcu(&mut (*node_raw).list);
-            drop(guard);
-
-            // 成功加入列表，转移 KernelArc 拥有的强引用给列表
-            let _ = node.into_raw();
-
-            if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
-                on_each_cpu(write_wp_regs_on_cpu, node_raw as *mut c_void, 1);
-            }
-            pr_info!("register_hwbp 方案 2: 初始化启用成功");
+    match scheme {
+        999 => {
+            pr_err!("register_hwbp: 方案 999 已被废弃，直接返回错误");
+            return Err(Error::EINVAL);
         }
-        return Ok(());
-    }
-
-    let task = unsafe {
-        let find_fn = crate::sym_must!(find_task_by_vpid);
-        let task_ptr = find_fn(pid as i32);
-        if task_ptr.is_null() {
-            return Err(Error::ESRCH);
-        }
-        task_ptr
-    };
-
-    let size = if unsafe { crate::ffi::kver >= ((6 << 16) + (0 << 8) + 0) } {
-        136
-    } else {
-        112
-    };
-
-    let mut attr = PerfEventAttr::new(bp_type, size);
-    attr.set_disabled(false);
-    attr.set_exclude_kernel(true);
-    attr.set_exclude_hv(true);
-    attr.bp_addr = addr;
-    attr.bp_len = len as u64;
-
-    unsafe {
-        let reg_fn = crate::sym!(register_user_hw_breakpoint).ok_or(Error::ENOSYS)?;
-        let bp = reg_fn(&mut attr, hwbp_triggered, core::ptr::null_mut(), task);
-        let bp_err = bp as isize;
-        if bp_err < 0 && bp_err > -4096 {
-            pr_err!("register_hwbp: 硬件断点注册失败, 错误码={}", bp_err);
-            return Err(Error::from(bp_err as i32));
-        }
-
-        let node: KernelArc<HwbpNode> = match KernelArc::new_zeroed() {
-            Ok(n) => n,
-            Err(e) => {
-                if let Some(unreg_fn) = crate::sym!(unregister_hw_breakpoint) {
-                    unreg_fn(bp);
+        2 => {
+            unsafe {
+                let install_fn = crate::sym!(watchpoint_handler_install_hook_helper); 
+                if let Some(install) = install_fn {
+                    install();
+                } else {
+                    crate::hooks::watchpoint::install_wp_hook(before_watchpoint_handler as *const c_void);
                 }
-                return Err(Error::from(e));
+
+                let node: KernelArc<HwbpNode> = KernelArc::new_zeroed().map_err(|_| Error::ENOMEM)?;
+                let node_raw = node.as_raw();
+
+                (*node_raw).pid = pid;
+                (*node_raw).addr = addr;
+                (*node_raw).bp_type = bp_type;
+                (*node_raw).len = len;
+                (*node_raw).scheme = 2;
+                (*node_raw).active.store(true, Ordering::Release);
+                (*node_raw).recovery_work.init(recovery_bp_work_func);
+
+                let guard = BP_LIST_LOCK.lock();
+                let bp_list_ptr = BP_LIST.get_ptr();
+                (*bp_list_ptr).add_rcu(&mut (*node_raw).list);
+                drop(guard);
+
+                let _ = node.into_raw();
+
+                if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
+                    on_each_cpu(write_wp_regs_on_cpu, node_raw as *mut c_void, 1);
+                }
+                pr_info!("register_hwbp 方案 2: 初始化启用成功");
             }
-        };
-
-        let node_raw = node.as_raw();
-        (*node_raw).bp = bp;
-        (*node_raw).pid = pid;
-        (*node_raw).addr = addr;
-        (*node_raw).bp_type = bp_type;
-        (*node_raw).len = len;
-        (*node_raw).scheme = scheme;
-        (*node_raw).orig_attr = attr;
-        (*node_raw).active.store(true, Ordering::Release);
-        (*node_raw).recovery_work.init(recovery_bp_work_func);
-
-        let guard = BP_LIST_LOCK.lock();
-        let bp_list_ptr = BP_LIST.get_ptr();
-        (*bp_list_ptr).add_rcu(&mut (*node_raw).list);
-        drop(guard);
-
-        // 成功加入列表，转移 KernelArc 拥有的强引用给列表
-        let _ = node.into_raw();
-
-        if let Some(enable_fn) = crate::sym!(perf_event_enable) {
-            enable_fn(bp);
+            return Ok(());
         }
-        pr_info!("register_hwbp: 注册成功, bp指针={:p}", bp);
+        1 => {
+            let task = unsafe {
+                let find_fn = crate::sym_must!(find_task_by_vpid);
+                let task_ptr = find_fn(pid as i32);
+                if task_ptr.is_null() {
+                    return Err(Error::ESRCH);
+                }
+                task_ptr
+            };
+
+            let size = if unsafe { crate::ffi::kver >= ((6 << 16) + (0 << 8) + 0) } {
+                136
+            } else {
+                112
+            };
+
+            let mut attr = PerfEventAttr::new(bp_type, size);
+            attr.set_disabled(false);
+            attr.set_exclude_kernel(true);
+            attr.set_exclude_hv(true);
+            attr.bp_addr = addr;
+            attr.bp_len = len as u64;
+
+            unsafe {
+                let reg_fn = crate::sym!(register_user_hw_breakpoint).ok_or(Error::ENOSYS)?;
+                let bp = reg_fn(&mut attr, hwbp_triggered, core::ptr::null_mut(), task);
+                let bp_err = bp as isize;
+                if bp_err < 0 && bp_err > -4096 {
+                    pr_err!("register_hwbp: 硬件断点注册失败, 错误码={}", bp_err);
+                    return Err(Error::from(bp_err as i32));
+                }
+
+                let node: KernelArc<HwbpNode> = match KernelArc::new_zeroed() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        if let Some(unreg_fn) = crate::sym!(unregister_hw_breakpoint) {
+                            unreg_fn(bp);
+                        }
+                        return Err(Error::from(e));
+                    }
+                };
+
+                let node_raw = node.as_raw();
+                (*node_raw).bp = bp;
+                (*node_raw).pid = pid;
+                (*node_raw).addr = addr;
+                (*node_raw).bp_type = bp_type;
+                (*node_raw).len = len;
+                (*node_raw).scheme = scheme;
+                (*node_raw).orig_attr = attr;
+                (*node_raw).active.store(true, Ordering::Release);
+                (*node_raw).recovery_work.init(recovery_bp_work_func);
+
+                let guard = BP_LIST_LOCK.lock();
+                let bp_list_ptr = BP_LIST.get_ptr();
+                (*bp_list_ptr).add_rcu(&mut (*node_raw).list);
+                drop(guard);
+
+                let _ = node.into_raw();
+
+                if let Some(enable_fn) = crate::sym!(perf_event_enable) {
+                    enable_fn(bp);
+                }
+                pr_info!("register_hwbp: 注册成功, bp指针={:p}", bp);
+            }
+        }
+        _ => {
+            pr_err!("register_hwbp: 不支持的方案 {}，仅支持方案 1 和 2", scheme);
+            return Err(Error::EINVAL);
+        }
     }
 
     Ok(())
