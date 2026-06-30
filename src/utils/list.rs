@@ -1,8 +1,10 @@
 // RCU 双向链表辅助结构，模仿 Linux 内核 list_head
 
 use core::sync::atomic::{AtomicPtr, Ordering};
+use zerocopy::{Immutable, KnownLayout};
 
 #[repr(C)]
+#[derive(Immutable, KnownLayout, Clone, Copy)]
 pub struct ListHead {
     pub next: *mut ListHead,
     pub prev: *mut ListHead,

@@ -3,9 +3,11 @@
 use core::ffi::{c_char, c_int, c_long, c_uint, c_void};
 use crate::ffi::offsets::{TaskStructOffset, CredOffset};
 use crate::utils::Error;
+use zerocopy::{FromBytes, IntoBytes, Immutable, KnownLayout};
 
 /// 性能事件属性结构体
 #[repr(C, align(8))]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
 pub struct PerfEventAttr {
     pub attr_type: u32,
     pub size: u32,
@@ -24,6 +26,7 @@ pub struct PerfEventAttr {
     pub clockid: i32,
     pub sample_regs_intr: u64,
     pub aux_watermark: u32,
+    pub _pad0: u32, // 显式 padding 以消除隐式 padding
     pub sample_max_stack: u16,
     pub __reserved_2: u16,
     pub __reserved_3: u32,

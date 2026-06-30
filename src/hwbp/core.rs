@@ -336,6 +336,7 @@ unsafe extern "C" fn unregister_bp_work_func(work: *mut WorkStruct) { unsafe {
 
 /// ARM64 处理器寄存器布局
 #[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
 pub struct PtRegs {
     pub regs: [u64; 31],
     pub sp: u64,
@@ -345,6 +346,7 @@ pub struct PtRegs {
 
 // Hook callback structures for Scheme 3 watchpoint
 #[repr(C, align(8))]
+#[derive(Immutable, KnownLayout, Clone, Copy)]
 pub struct HookFargs3 {
     pub chain: *mut c_void,
     pub skip_origin: c_int,
@@ -357,6 +359,7 @@ pub struct HookFargs3 {
 }
 
 #[repr(C)]
+#[derive(Immutable, KnownLayout, Clone, Copy)]
 pub struct HookLocal {
     pub data: [u64; 8],
 }

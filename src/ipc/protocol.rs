@@ -80,6 +80,7 @@ pub struct HwbpInfoCmd {
 
 /// 共享内存数据交互通道缓冲区定义
 #[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct ShmChannel {
     pub magic: u32,
     pub cmd: u32,

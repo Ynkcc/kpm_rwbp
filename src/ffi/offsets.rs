@@ -1,7 +1,10 @@
 // 进程及凭证结构偏移定义（用于适配不同 Linux 内核版本的字段位置）
 
+use zerocopy::{FromBytes, IntoBytes, Immutable, KnownLayout};
+
 /// 对应内核中 task_struct 的关键字段偏移
 #[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
 pub struct TaskStructOffset {
     pub pid_offset: i16,
     pub tgid_offset: i16,
@@ -24,6 +27,7 @@ pub struct TaskStructOffset {
 
 /// 对应内核中 cred 结构的关键字段偏移
 #[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
 pub struct CredOffset {
     pub usage_offset: i16,
     pub subscribers_offset: i16,
@@ -56,6 +60,7 @@ pub struct CredOffset {
 
 /// 对应内核中 mm_struct 的关键字段偏移
 #[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
 pub struct MmStructOffset {
     pub mmap_base_offset: i16,
     pub task_size_offset: i16,

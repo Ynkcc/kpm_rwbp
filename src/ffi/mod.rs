@@ -4,6 +4,7 @@
 
 use core::ffi::c_void;
 use core::ffi::c_int;
+use zerocopy::{Immutable, KnownLayout};
 
 pub mod offsets;
 pub mod symbols;
@@ -30,12 +31,14 @@ pub use symbols::{
 
 /// 拦截时用于保留寄存器或局部私有上下文的内核数据块
 #[repr(C)]
+#[derive(Immutable, KnownLayout, Clone, Copy)]
 pub struct hook_local_t {
     pub data: [u64; 8],
 }
 
 /// 系统调用 Hook 触发时传入的内核寄存器及控制参数结构
 #[repr(C, align(8))]
+#[derive(Immutable, KnownLayout, Clone, Copy)]
 pub struct hook_fargs0_t {
     pub chain: *mut c_void,
     pub skip_origin: c_int,
@@ -46,6 +49,7 @@ pub struct hook_fargs0_t {
 
 /// Watchpoint 硬件拦截触发时传入的特定寄存器与控制参数结构
 #[repr(C, align(8))]
+#[derive(Immutable, KnownLayout, Clone, Copy)]
 pub struct hook_fargs4_t {
     pub chain: *mut c_void,
     pub skip_origin: c_int,
