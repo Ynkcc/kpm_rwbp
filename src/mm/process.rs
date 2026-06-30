@@ -1,11 +1,12 @@
 // 进程虚拟内存读写与内核/用户空间数据拷贝
 
 use core::ffi::c_void;
+use crate::utils::Error;
 
 /// 将内核数据拷贝到用户空间虚拟地址
-pub fn copy_to_user(to: *mut c_void, from: &[u8]) -> Result<(), i32> {
+pub fn copy_to_user(to: *mut c_void, from: &[u8]) -> Result<(), Error> {
     if to.is_null() {
-        return Err(-14); // EFAULT
+        return Err(Error::EFAULT);
     }
     unsafe {
         let copy_fn = crate::sym_must!(__arch_copy_to_user);
@@ -20,13 +21,13 @@ pub fn copy_to_user(to: *mut c_void, from: &[u8]) -> Result<(), i32> {
             }
         }
     }
-    Err(-14) // EFAULT
+    Err(Error::EFAULT)
 }
 
 /// 从用户空间虚拟地址拷贝数据到内核缓冲区
-pub fn copy_from_user(to: &mut [u8], from: *const c_void) -> Result<(), i32> {
+pub fn copy_from_user(to: &mut [u8], from: *const c_void) -> Result<(), Error> {
     if from.is_null() {
-        return Err(-14); // EFAULT
+        return Err(Error::EFAULT);
     }
     unsafe {
         let copy_fn = crate::sym_must!(__arch_copy_from_user);
@@ -41,7 +42,7 @@ pub fn copy_from_user(to: &mut [u8], from: *const c_void) -> Result<(), i32> {
             }
         }
     }
-    Err(-14) // EFAULT
+    Err(Error::EFAULT)
 }
 
 struct Arm64Paging {
@@ -177,13 +178,13 @@ unsafe fn walk_to_pmd(pgd_va: u64, va: u64, paging: &Arm64Paging) -> PmdWalkResu
 }
 
 /// 读取指定进程的用户虚拟内存数据，并安全写入另一个用户态虚拟地址（零拷贝直接读取，支持PTE缓存）
-pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64) -> Result<usize, i32> {
+pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64) -> Result<usize, Error> {
     let task = unsafe {
         let find_fn = crate::sym_must!(find_task_by_vpid);
         find_fn(pid as i32)
     };
     if task.is_null() {
-        return Err(-3); // ESRCH
+        return Err(Error::ESRCH);
     }
 
     let mm = unsafe {
@@ -191,7 +192,7 @@ pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64)
         get_mm_fn(task)
     };
     if mm.is_null() {
-        return Err(-14); // EFAULT
+        return Err(Error::EFAULT);
     }
 
     let pgd_offset = unsafe { crate::ffi::mm_struct_offset.pgd_offset } as usize;
@@ -202,7 +203,7 @@ pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64)
             let mmput_fn = crate::sym_must!(mmput);
             mmput_fn(mm);
         }
-        return Err(-14);
+        return Err(Error::EFAULT);
     }
 
     let paging = Arm64Paging::new();
@@ -315,13 +316,13 @@ pub fn read_process_memory(pid: u32, vaddr: u64, size: u64, dest_user_addr: u64)
 }
 
 /// 从一个用户态源虚拟地址，安全写入指定进程的虚拟内存中（零拷贝直接写入，支持PTE缓存）
-pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64) -> Result<usize, i32> {
+pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64) -> Result<usize, Error> {
     let task = unsafe {
         let find_fn = crate::sym_must!(find_task_by_vpid);
         find_fn(pid as i32)
     };
     if task.is_null() {
-        return Err(-3); // ESRCH
+        return Err(Error::ESRCH);
     }
 
     let mm = unsafe {
@@ -329,7 +330,7 @@ pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64)
         get_mm_fn(task)
     };
     if mm.is_null() {
-        return Err(-14); // EFAULT
+        return Err(Error::EFAULT);
     }
 
     let pgd_offset = unsafe { crate::ffi::mm_struct_offset.pgd_offset } as usize;
@@ -340,7 +341,7 @@ pub fn write_process_memory(pid: u32, vaddr: u64, size: u64, src_user_addr: u64)
             let mmput_fn = crate::sym_must!(mmput);
             mmput_fn(mm);
         }
-        return Err(-14);
+        return Err(Error::EFAULT);
     }
 
     let paging = Arm64Paging::new();

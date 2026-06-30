@@ -2,6 +2,7 @@
 
 use core::ffi::{c_char, c_int, c_long, c_uint, c_void};
 use crate::ffi::offsets::{TaskStructOffset, CredOffset};
+use crate::utils::Error;
 
 /// 性能事件属性结构体
 #[repr(C, align(8))]
@@ -354,36 +355,30 @@ pub unsafe fn lookup_sym<T>(name: &str) -> Option<T> {
 
 /// 初始化需要运行时查找的内核符号
 /// KP 核心导出的符号已通过 extern 声明直接链接，无需此步
-pub unsafe fn init_symbols() -> Result<(), i32> {
+pub unsafe fn init_symbols() -> Result<(), Error> {
     let syms_ptr = core::ptr::addr_of_mut!(SYMS);
 
-    // 必要符号 - 必须存在
-    // __kmalloc 在新内核中可能被重命名为 kmalloc
     (*syms_ptr).__kmalloc = lookup_sym("__kmalloc")
-        .or_else(|| lookup_sym("kmalloc")).ok_or(-2)?;
-    (*syms_ptr).kfree = lookup_sym("kfree").ok_or(-2)?;
-    (*syms_ptr).mmput = lookup_sym("mmput").ok_or(-2)?;
-    (*syms_ptr).get_task_mm = lookup_sym("get_task_mm").ok_or(-2)?;
-    // find_task_by_vpid 在新内核中可能被重命名为 find_vpid
+        .or_else(|| lookup_sym("kmalloc")).ok_or(Error::ENOENT)?;
+    (*syms_ptr).kfree = lookup_sym("kfree").ok_or(Error::ENOENT)?;
+    (*syms_ptr).mmput = lookup_sym("mmput").ok_or(Error::ENOENT)?;
+    (*syms_ptr).get_task_mm = lookup_sym("get_task_mm").ok_or(Error::ENOENT)?;
     (*syms_ptr).find_task_by_vpid = lookup_sym("find_task_by_vpid")
-        .or_else(|| lookup_sym("find_vpid")).ok_or(-2)?;
-    (*syms_ptr).__task_pid_nr_ns = lookup_sym("__task_pid_nr_ns").ok_or(-2)?;
+        .or_else(|| lookup_sym("find_vpid")).ok_or(Error::ENOENT)?;
+    (*syms_ptr).__task_pid_nr_ns = lookup_sym("__task_pid_nr_ns").ok_or(Error::ENOENT)?;
     
-    // 尝试查找 spinlock 符号（新内核可能去掉了前缀下划线）
     (*syms_ptr)._raw_spin_lock_irqsave = lookup_sym("_raw_spin_lock_irqsave")
-        .or_else(|| lookup_sym("raw_spin_lock_irqsave")).ok_or(-2)?;
+        .or_else(|| lookup_sym("raw_spin_lock_irqsave")).ok_or(Error::ENOENT)?;
     (*syms_ptr)._raw_spin_unlock_irqrestore = lookup_sym("_raw_spin_unlock_irqrestore")
-        .or_else(|| lookup_sym("raw_spin_unlock_irqrestore")).ok_or(-2)?;
+        .or_else(|| lookup_sym("raw_spin_unlock_irqrestore")).ok_or(Error::ENOENT)?;
     (*syms_ptr)._raw_spin_lock_init = lookup_sym("_raw_spin_lock_init")
         .or_else(|| lookup_sym("raw_spin_lock_init"));
         
-    // __arch_copy_to_user 在新内核中可能被重命名为 copy_to_user
     (*syms_ptr).__arch_copy_to_user = lookup_sym("__arch_copy_to_user")
-        .or_else(|| lookup_sym("copy_to_user")).ok_or(-2)?;
-    // __arch_copy_from_user 在新内核中可能被重命名为 copy_from_user
+        .or_else(|| lookup_sym("copy_to_user")).ok_or(Error::ENOENT)?;
     (*syms_ptr).__arch_copy_from_user = lookup_sym("__arch_copy_from_user")
-        .or_else(|| lookup_sym("copy_from_user")).ok_or(-2)?;
-    (*syms_ptr).access_process_vm = lookup_sym("access_process_vm").ok_or(-2)?;
+        .or_else(|| lookup_sym("copy_from_user")).ok_or(Error::ENOENT)?;
+    (*syms_ptr).access_process_vm = lookup_sym("access_process_vm").ok_or(Error::ENOENT)?;
 
     // 可选符号 - 不存在时设为 None
     (*syms_ptr).msleep = lookup_sym("msleep");
@@ -445,21 +440,21 @@ pub unsafe fn init_symbols() -> Result<(), i32> {
         }
         (*syms_ptr).linear_voffset = (*syms_ptr).page_offset_val.wrapping_sub((*syms_ptr).memstart_addr_val);
     } else {
-        return Err(-2);
-    }
+            return Err(Error::ENOENT);
+        }
 
     let m_syms = MandatorySymbols {
-        kmalloc: (*syms_ptr).__kmalloc.ok_or(-2)?,
-        kfree: (*syms_ptr).kfree.ok_or(-2)?,
-        mmput: (*syms_ptr).mmput.ok_or(-2)?,
-        get_task_mm: (*syms_ptr).get_task_mm.ok_or(-2)?,
-        find_task_by_vpid: (*syms_ptr).find_task_by_vpid.ok_or(-2)?,
-        __task_pid_nr_ns: (*syms_ptr).__task_pid_nr_ns.ok_or(-2)?,
-        _raw_spin_lock_irqsave: (*syms_ptr)._raw_spin_lock_irqsave.ok_or(-2)?,
-        _raw_spin_unlock_irqrestore: (*syms_ptr)._raw_spin_unlock_irqrestore.ok_or(-2)?,
-        __arch_copy_to_user: (*syms_ptr).__arch_copy_to_user.ok_or(-2)?,
-        __arch_copy_from_user: (*syms_ptr).__arch_copy_from_user.ok_or(-2)?,
-        access_process_vm: (*syms_ptr).access_process_vm.ok_or(-2)?,
+        kmalloc: (*syms_ptr).__kmalloc.ok_or(Error::ENOENT)?,
+        kfree: (*syms_ptr).kfree.ok_or(Error::ENOENT)?,
+        mmput: (*syms_ptr).mmput.ok_or(Error::ENOENT)?,
+        get_task_mm: (*syms_ptr).get_task_mm.ok_or(Error::ENOENT)?,
+        find_task_by_vpid: (*syms_ptr).find_task_by_vpid.ok_or(Error::ENOENT)?,
+        __task_pid_nr_ns: (*syms_ptr).__task_pid_nr_ns.ok_or(Error::ENOENT)?,
+        _raw_spin_lock_irqsave: (*syms_ptr)._raw_spin_lock_irqsave.ok_or(Error::ENOENT)?,
+        _raw_spin_unlock_irqrestore: (*syms_ptr)._raw_spin_unlock_irqrestore.ok_or(Error::ENOENT)?,
+        __arch_copy_to_user: (*syms_ptr).__arch_copy_to_user.ok_or(Error::ENOENT)?,
+        __arch_copy_from_user: (*syms_ptr).__arch_copy_from_user.ok_or(Error::ENOENT)?,
+        access_process_vm: (*syms_ptr).access_process_vm.ok_or(Error::ENOENT)?,
     };
     *M_SYMS.0.get() = Some(m_syms);
 

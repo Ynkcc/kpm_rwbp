@@ -1,3 +1,5 @@
+#![allow(non_camel_case_types)]
+
 // FFI bindings - 类型与 KernelPatch 头文件兼容
 
 use core::ffi::c_void;

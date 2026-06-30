@@ -3,14 +3,14 @@
 use crate::mm::{read_process_memory, write_process_memory};
 use crate::hwbp::core::{register_hwbp, unregister_hwbp, unregister_all_hwbp, read_hwbp_info};
 use crate::ipc::protocol::*;
+use crate::utils::Error;
 use core::ffi::c_void;
 use zerocopy::FromBytes;
 
-/// 处理共享内存通道的分发函数，解析具体的操作命令并调用相应的内核服务
 pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
     if shm.is_null() || (*shm).magic != SHM_MAGIC {
         pr_warn!("rwbp_dispatch: 无效的共享内存魔数或空指针！");
-        return -22; // -EINVAL
+        return Error::EINVAL as i64;
     }
 
     let shm_ref = &mut *shm;
@@ -21,7 +21,7 @@ pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
         OP_READ_MEM => {
             let Ok((rcmd, _)) = CopyMemory::read_from_prefix(&shm_ref.payload[..]) else {
                 pr_warn!("解析 CopyMemory 结构失败");
-                return -22;
+                return Error::EINVAL as i64;
             };
 
             pr_info!(
@@ -32,10 +32,9 @@ pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
             );
 
             if rcmd.size > shm_ref.payload.len() as u64 {
-                return -22; // -EINVAL
+                return Error::EINVAL as i64;
             }
 
-            // 直接读取数据到共享内存 payload 缓冲区
             let dest_user_addr = shm_ref.payload.as_mut_ptr() as u64;
             match read_process_memory(rcmd.pid, rcmd.addr, rcmd.size, dest_user_addr) {
                 Ok(read_res) => {
@@ -52,7 +51,7 @@ pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
         }
         OP_WRITE_MEM => {
             let Ok((wcmd, _)) = WriteMemory::read_from_prefix(&shm_ref.payload[..]) else {
-                return -22;
+                return Error::EINVAL as i64;
             };
 
             pr_info!(
@@ -77,7 +76,7 @@ pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
         }
         OP_SET_HW_BREAKPOINT => {
             let Ok((bcmd, _)) = HwBreakpointCmd::read_from_prefix(&shm_ref.payload[..]) else {
-                return -22;
+                return Error::EINVAL as i64;
             };
 
             match register_hwbp(bcmd.pid, bcmd.addr, bcmd.bp_type, bcmd.len, bcmd.scheme) {
@@ -87,7 +86,7 @@ pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
         }
         OP_REMOVE_HW_BREAKPOINT => {
             let Ok((bcmd, _)) = HwBreakpointCmd::read_from_prefix(&shm_ref.payload[..]) else {
-                return -22;
+                return Error::EINVAL as i64;
             };
 
             match unregister_hwbp(bcmd.pid, bcmd.addr) {
@@ -103,7 +102,7 @@ pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
         }
         OP_READ_HW_BP_INFO => {
             let Ok((icmd, _)) = HwbpInfoCmd::read_from_prefix(&shm_ref.payload[..]) else {
-                return -22;
+                return Error::EINVAL as i64;
             };
 
             let max_allowed = shm_ref.payload.len() / core::mem::size_of::<HwbpHitItem>();
@@ -125,7 +124,7 @@ pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
         }
         _ => {
             pr_warn!("未知的命令: {}", cmd);
-            -22 // -EINVAL
+            Error::EINVAL as i64
         }
     }
 }
