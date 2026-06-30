@@ -859,7 +859,6 @@ pub fn unregister_hwbp(pid: u32, addr: u64) -> Result<(), i32> {
             );
             if success == 0 {
                 IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                unregister_bp_work_func(&mut (*target_node).unreg_work);
             }
         } else {
             IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
@@ -909,7 +908,6 @@ pub fn unregister_all_hwbp() -> Result<(), i32> {
                 );
                 if success == 0 {
                     IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                    unregister_bp_work_func(&mut (*curr_node).unreg_work);
                 }
             } else {
                 IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
@@ -1006,11 +1004,12 @@ pub fn read_hwbp_info(
                         },
                     };
 
-                    // 尝试读取，若发生冲突则重试最多 3 次
-                    for _ in 0..3 {
+                    // 尝试读取，若发生冲突则重试最多 10 次
+                    for _ in 0..10 {
                         let seq1 = seq_atom.load(Ordering::Acquire);
                         if seq1 % 2 != 0 {
                             // 奇数表示正在写入，重试
+                            core::hint::spin_loop();
                             continue;
                         }
                         // 读取记录
@@ -1065,6 +1064,9 @@ pub fn read_hwbp_info(
         }
     }
     let _guard = NodeGuard(found_node);
+
+    // 【修复】：显式释放 RCU 读锁，防止后续 copy_to_user 缺页休眠导致死锁
+    drop(_rcu_guard);
 
     // 锁已被全部安全释放，可以自由进行可能导致睡眠/缺页 of 拷贝
     use crate::mm::copy_to_user;

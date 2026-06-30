@@ -145,11 +145,26 @@ pub unsafe extern "C" fn rwbp_exit(_reserved: *mut c_void) -> i64 {
     // 先注销和排队清理任务，触发 IN_FLIGHT 的递增和排队
     crate::hooks::syscall::handle_cleanup();
 
+    // 先手动释放 KernelPatch 框架在 supercall 分发器中对本进程持有的 RCU 读锁，
+    // 从而避免在此后的 msleep 中触发 Warning，并且打破 synchronize_rcu 的死锁环，使清理工作项可以顺利运行并递减 IN_FLIGHT
+    unsafe {
+        if let Some(rcu_read_unlock_fn) = crate::sym!(rcu_read_unlock) {
+            rcu_read_unlock_fn();
+        }
+    }
+
     // 再循环等待所有在途的任务完全退空
     while crate::hwbp::core::IN_FLIGHT.load(Ordering::SeqCst) > 0 {
         pr_info!("模块注销等待中... 在途工作任务数: {}", crate::hwbp::core::IN_FLIGHT.load(Ordering::SeqCst));
         if let Some(msleep_fn) = sym!(msleep) {
             msleep_fn(10);
+        }
+    }
+
+    // 重新获取 RCU 读锁，以满足 KernelPatch 卸载框架外层对 rcu_read_unlock() 的对称调用
+    unsafe {
+        if let Some(rcu_read_lock_fn) = crate::sym!(rcu_read_lock) {
+            rcu_read_lock_fn();
         }
     }
 

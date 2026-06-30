@@ -5,7 +5,7 @@ use crate::ffi::{get_current, HookFargs0};
 
 // 全局控制变量
 pub static SHM_USER_VADDR: AtomicU64 = AtomicU64::new(0);
-pub static CURRENT_CONTROL_TASK: AtomicU64 = AtomicU64::new(0);
+pub static CURRENT_CONTROL_TGID: AtomicU64 = AtomicU64::new(0);
 
 // Syscall 参数提取辅助函数
 #[inline(always)]
@@ -59,6 +59,7 @@ pub unsafe extern "C" fn rwbp_fstatfs_hook(args: *mut crate::ffi::hook_fargs4_t,
         return;
     }
 
+    let tgid = *( (current as usize + crate::ffi::task_struct_offset.tgid_offset as usize) as *const u32 );
     let cmd = get_syscall_arg(args as *mut c_void, 2) as u32;
     let user_ptr = arg0 as *const c_void;
 
@@ -93,9 +94,12 @@ pub unsafe extern "C" fn rwbp_fstatfs_hook(args: *mut crate::ffi::hook_fargs4_t,
             if let Err(err) = crate::mm::copy_from_user(bcmd_slice, user_ptr) {
                 err as i64
             } else {
-                if CURRENT_CONTROL_TASK.load(Ordering::SeqCst) == 0 {
-                    CURRENT_CONTROL_TASK.store(current as u64, Ordering::SeqCst);
-                }
+                let _ = CURRENT_CONTROL_TGID.compare_exchange(
+                    0,
+                    tgid as u64,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
                 match crate::hwbp::core::register_hwbp(bcmd.pid, bcmd.addr, bcmd.bp_type, bcmd.len, bcmd.scheme) {
                     Ok(_) => 0,
                     Err(err) => err as i64,
@@ -137,8 +141,11 @@ pub unsafe extern "C" fn rwbp_fstatfs_hook(args: *mut crate::ffi::hook_fargs4_t,
                         let actual_count_offset = core::mem::offset_of!(crate::ipc::protocol::HwbpInfoCmd, actual_count);
                         let dest_ptr = (arg0 + actual_count_offset as u64) as *mut c_void;
                         let src_slice = &actual_count.to_ne_bytes();
-                        let _ = crate::mm::copy_to_user(dest_ptr, src_slice);
-                        0
+                        if let Err(err) = crate::mm::copy_to_user(dest_ptr, src_slice) {
+                            err as i64
+                        } else {
+                            0
+                        }
                     }
                     Err(err) => err as i64,
                 }
@@ -154,9 +161,10 @@ pub unsafe extern "C" fn rwbp_fstatfs_hook(args: *mut crate::ffi::hook_fargs4_t,
 // __NR_exit_group (94) 系统调用拦截 Hook，在控制进程退出时清理资源
 pub unsafe extern "C" fn rwbp_exit_group_hook(_args: *mut crate::ffi::hook_fargs4_t, _udata: *mut c_void) {
     let current = get_current();
-    let ctrl_task = CURRENT_CONTROL_TASK.load(Ordering::SeqCst);
-    if ctrl_task != 0 && ctrl_task == current as u64 {
+    let tgid = *( (current as usize + crate::ffi::task_struct_offset.tgid_offset as usize) as *const u32 );
+    let ctrl_tgid = CURRENT_CONTROL_TGID.load(Ordering::SeqCst);
+    if ctrl_tgid != 0 && ctrl_tgid == tgid as u64 {
         handle_cleanup();
-        CURRENT_CONTROL_TASK.store(0, Ordering::SeqCst);
+        CURRENT_CONTROL_TGID.store(0, Ordering::SeqCst);
     }
 }
