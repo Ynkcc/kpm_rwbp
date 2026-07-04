@@ -259,8 +259,6 @@ pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
                             let vaddr_bytes = alloc_vaddr.to_ne_bytes();
                             shm_ref.payload[..8].copy_from_slice(&vaddr_bytes);
 
-                            let mmput_fn = crate::sym_must!(mmput);
-                            mmput_fn(mm);
                             alloc_vaddr as i64
                         }
                         Err(err) => {
@@ -337,28 +335,27 @@ pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
                     let kbuf_slice = core::slice::from_raw_parts_mut(kbuf as *mut u8, size);
                     match crate::mm::copy_from_user(kbuf_slice, wcmd.buffer as *const c_void) {
                         Ok(_) => {
-                            let mut write_res = Ok(());
+                            let mut gp_copy = None;
                             {
                                 let _guard = GHOST_POOL_LOCK.lock();
-                                let mut gp_idx = None;
                                 for i in 0..16 {
                                     if let Some(ref gp) = GHOST_POOL[i] {
                                         if !gp.is_placeholder() && gp.vaddr == wcmd.vaddr {
-                                            gp_idx = Some(i);
+                                            gp_copy = Some(*gp);
                                             break;
                                         }
                                     }
                                 }
+                            }
 
-                                if let Some(idx) = gp_idx {
-                                    let gp_ref = GHOST_POOL[idx].as_ref().unwrap();
-                                    write_res = ghost_write(gp_ref, wcmd.offset, kbuf_slice);
-                                    if write_res.is_ok() {
-                                        ghost_sync_icache(gp_ref);
-                                    }
-                                } else {
-                                    write_res = Err(Error::ENOENT);
+                            let mut write_res = Ok(());
+                            if let Some(gp) = gp_copy {
+                                write_res = ghost_write(&gp, wcmd.offset, kbuf_slice);
+                                if write_res.is_ok() {
+                                    ghost_sync_icache(&gp);
                                 }
+                            } else {
+                                write_res = Err(Error::ENOENT);
                             }
 
                             kfree_fn(kbuf);

@@ -24,6 +24,7 @@ struct VmaHead {
 
 /// GhostPage 控制结构体
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct GhostPage {
     pub task: *mut c_void,
     pub mm: *mut c_void,
@@ -319,6 +320,7 @@ pub unsafe fn ghost_free(gp: &mut GhostPage) -> Result<(), Error> {
 
     unsafe {
         let free_pages_fn = SYMS.free_pages.ok_or(Error::ENOSYS)?;
+        let mmput_fn = SYMS.mmput.ok_or(Error::ENOSYS)?;
 
         let page_count = 1 << gp.order;
         for i in 0..page_count {
@@ -342,15 +344,18 @@ pub unsafe fn ghost_free(gp: &mut GhostPage) -> Result<(), Error> {
             let ipi_cb: unsafe extern "C" fn(*mut c_void) = ghost_free_drain_ipi;
             on_each_cpu_fn(ipi_cb, core::ptr::null_mut(), 1);
         } else {
-            pr_warn!("ghost_free: SYMS.on_each_cpu 不存在，跳过核间 IPI 同步！");
+            pr_warn!("ghost_free: SYMS.on_each_cpu 不存在，跳过核间 IPI同步！");
         }
 
         free_pages_fn(gp.kaddr, gp.order);
+        mmput_fn(gp.mm);
     }
 
     gp.installed = false;
     gp.kaddr = 0;
     gp.vaddr = 0;
+    gp.mm = core::ptr::null_mut();
+    gp.task = core::ptr::null_mut();
 
     Ok(())
 }
