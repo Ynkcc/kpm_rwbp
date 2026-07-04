@@ -258,3 +258,153 @@ bool run_case_hwbp_concurrency(int anon_fd)
         return false;
     }
 }
+
+bool run_case_hwbp_interfaces(int anon_fd)
+{
+    printf("[*] [hwbp_interfaces] 开始硬件断点新接口功能验证...\n");
+    fflush(stdout);
+
+    // 1. 获取硬件能力
+    hwbp_caps_t caps;
+    memset(&caps, 0, sizeof(caps));
+    long ret = kpm_get_hwbp_caps(anon_fd, &caps);
+    if (ret != 0) {
+        printf("[-] [hwbp_interfaces] 获取硬件能力失败, ret=%ld\n", ret);
+        return false;
+    }
+    printf("[+] [hwbp_interfaces] 硬件能力获取成功: 最大 Breakpoints = %u, 最大 Watchpoints = %u\n",
+           caps.max_breakpoints, caps.max_watchpoints);
+    if (caps.max_breakpoints == 0 || caps.max_watchpoints == 0) {
+        printf("[-] [hwbp_interfaces] 获取到的硬件能力数量不合法（为0）\n");
+        return false;
+    }
+
+    // 2. 注册硬件断点 (Scheme 1)
+    volatile uint64_t bp_val __attribute__((aligned(8))) = 11111111ULL;
+    uint32_t my_pid = (uint32_t)getpid();
+
+    hw_breakpoint_cmd_t bcmd;
+    memset(&bcmd, 0, sizeof(bcmd));
+    bcmd.pid    = my_pid;
+    bcmd.addr   = (uint64_t)&bp_val;
+    bcmd.type   = 3; // rw
+    bcmd.len    = 8;
+    bcmd.scheme = 1; // Scheme 1
+
+    printf("[*] [hwbp_interfaces] 注册硬件断点 (地址: 0x%llx)...\n", (unsigned long long)bcmd.addr);
+    ret = kpm_ipc_cmd(anon_fd, OP_SET_HW_BREAKPOINT, &bcmd);
+    if (ret != 0) {
+        printf("[-] [hwbp_interfaces] 注册断点失败, ret=%ld\n", ret);
+        return false;
+    }
+
+    // 等待生效
+    usleep(100000);
+
+    // 3. 状态查询：刚注册完，active 应该为 1，hit_count 应为 0
+    hwbp_query_cmd_t qcmd;
+    ret = kpm_query_hwbp_status(anon_fd, my_pid, (uint64_t)&bp_val, &qcmd);
+    if (ret != 0) {
+        printf("[-] [hwbp_interfaces] 查询状态失败, ret=%ld\n", ret);
+        return false;
+    }
+    printf("[+] [hwbp_interfaces] 状态查询: active = %u, hit_count = %llu, scheme = %u\n",
+           qcmd.active, (unsigned long long)qcmd.hit_count, qcmd.scheme);
+    if (qcmd.active != 1 || qcmd.hit_count != 0) {
+        printf("[-] [hwbp_interfaces] 初始状态校验失败\n");
+        return false;
+    }
+
+    // 4. 触发一次命中
+    printf("[*] [hwbp_interfaces] 触发断点命中 (向地址写入新值)... \n");
+    bp_val = 22222222ULL;
+    usleep(200000); // 延迟等待中断和工作项恢复
+
+    // 再次查询命中计数
+    ret = kpm_query_hwbp_status(anon_fd, my_pid, (uint64_t)&bp_val, &qcmd);
+    if (ret != 0 || qcmd.hit_count == 0) {
+        printf("[-] [hwbp_interfaces] 命中计数未按预期递增, ret=%ld, hit_count=%llu\n", ret, (unsigned long long)qcmd.hit_count);
+        return false;
+    }
+    uint64_t first_hit_count = qcmd.hit_count;
+    printf("[+] [hwbp_interfaces] 触发后命中计数: %llu\n", (unsigned long long)first_hit_count);
+
+    // 5. 禁用断点
+    printf("[*] [hwbp_interfaces] 禁用该断点...\n");
+    ret = kpm_disable_hwbp(anon_fd, my_pid, (uint64_t)&bp_val);
+    if (ret != 0) {
+        printf("[-] [hwbp_interfaces] 禁用操作返回错误: %ld\n", ret);
+        return false;
+    }
+
+    // 查询状态确认被禁用
+    ret = kpm_query_hwbp_status(anon_fd, my_pid, (uint64_t)&bp_val, &qcmd);
+    if (ret != 0 || qcmd.active != 0) {
+        printf("[-] [hwbp_interfaces] 禁用后查询状态不为禁用状态, active=%u\n", qcmd.active);
+        return false;
+    }
+    printf("[+] [hwbp_interfaces] 状态验证: 已成功禁用 (active = %u)\n", qcmd.active);
+
+    // 6. 在禁用状态下触发写入，应该不触发命中计数递增
+    printf("[*] [hwbp_interfaces] 在禁用状态下尝试触发写入...\n");
+    bp_val = 33333333ULL;
+    usleep(200000);
+
+    ret = kpm_query_hwbp_status(anon_fd, my_pid, (uint64_t)&bp_val, &qcmd);
+    if (ret != 0 || qcmd.hit_count != first_hit_count) {
+        printf("[-] [hwbp_interfaces] 异常：禁用状态下命中计数发生了变化! hit_count=%llu, 之前为=%llu\n",
+               (unsigned long long)qcmd.hit_count, (unsigned long long)first_hit_count);
+        return false;
+    }
+    printf("[+] [hwbp_interfaces] 验证通过: 禁用状态下确实未触发命中\n");
+
+    // 7. 重新激活断点
+    printf("[*] [hwbp_interfaces] 重新激活该断点...\n");
+    ret = kpm_enable_hwbp(anon_fd, my_pid, (uint64_t)&bp_val);
+    if (ret != 0) {
+        printf("[-] [hwbp_interfaces] 激活操作返回错误: %ld\n", ret);
+        return false;
+    }
+
+    // 查询状态确认被激活
+    ret = kpm_query_hwbp_status(anon_fd, my_pid, (uint64_t)&bp_val, &qcmd);
+    if (ret != 0 || qcmd.active != 1) {
+        printf("[-] [hwbp_interfaces] 激活后查询状态不为激活状态, active=%u\n", qcmd.active);
+        return false;
+    }
+    printf("[+] [hwbp_interfaces] 状态验证: 已成功重新激活 (active = %u)\n", qcmd.active);
+
+    // 8. 重新激活后触发一次，应该再次增加命中计数
+    printf("[*] [hwbp_interfaces] 重新激活后再次触发写入...\n");
+    bp_val = 44444444ULL;
+    usleep(200000);
+
+    ret = kpm_query_hwbp_status(anon_fd, my_pid, (uint64_t)&bp_val, &qcmd);
+    if (ret != 0 || qcmd.hit_count <= first_hit_count) {
+        printf("[-] [hwbp_interfaces] 重新激活后没有触发命中, hit_count=%llu\n", (unsigned long long)qcmd.hit_count);
+        return false;
+    }
+    printf("[+] [hwbp_interfaces] 验证通过: 激活后重新捕获了命中计数: %llu\n", (unsigned long long)qcmd.hit_count);
+
+    // 9. 注销断点并确认无法被查询到
+    printf("[*] [hwbp_interfaces] 注销硬件断点...\n");
+    ret = kpm_ipc_cmd(anon_fd, OP_REMOVE_HW_BREAKPOINT, &bcmd);
+    if (ret != 0) {
+        printf("[-] [hwbp_interfaces] 注销断点返回失败, ret=%ld\n", ret);
+        return false;
+    }
+    usleep(100000);
+
+    // 注销后查询应该失败 (返回 -1 / ENOENT)
+    ret = kpm_query_hwbp_status(anon_fd, my_pid, (uint64_t)&bp_val, &qcmd);
+    if (ret == 0) {
+        printf("[-] [hwbp_interfaces] 异常：断点已注销，但依然能查询到状态！\n");
+        return false;
+    }
+    printf("[+] [hwbp_interfaces] 状态验证: 断点注销后查询失败，生命周期结束。\n");
+
+    printf("[+] [hwbp_interfaces] 所有新接口单元测试全部顺利通过！\n");
+    fflush(stdout);
+    return true;
+}
+

@@ -2,6 +2,7 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::ffi::{get_current, HookFargs0};
+use zerocopy::IntoBytes;
 
 // 全局控制变量
 pub static SHM_USER_VADDR: AtomicU64 = AtomicU64::new(0);
@@ -145,6 +146,56 @@ pub unsafe extern "C" fn rwbp_fstatfs_hook(args: *mut crate::ffi::hook_fargs4_t,
                         let dest_ptr = (arg0 + actual_count_offset as u64) as *mut c_void;
                         let src_slice = &actual_count.to_ne_bytes();
                         if let Err(err) = crate::mm::copy_to_user(dest_ptr, src_slice) {
+                            err as i64
+                        } else {
+                            0
+                        }
+                    }
+                    Err(err) => err as i64,
+                }
+            }
+        }
+        crate::ipc::protocol::OP_GET_HW_BREAKPOINT_CAPS => {
+            let (brps, wrps) = crate::hwbp::core::get_hwbp_caps();
+            let caps = crate::ipc::protocol::HwbpCaps {
+                max_breakpoints: brps,
+                max_watchpoints: wrps,
+            };
+            let caps_slice = caps.as_bytes();
+            if let Err(err) = crate::mm::copy_to_user(user_ptr as *mut c_void, caps_slice) {
+                err as i64
+            } else {
+                0
+            }
+        }
+        crate::ipc::protocol::OP_ENABLE_HW_BREAKPOINT | crate::ipc::protocol::OP_DISABLE_HW_BREAKPOINT => {
+            let mut bcmd = core::mem::zeroed::<crate::ipc::protocol::HwBreakpointCmd>();
+            let bcmd_slice = core::slice::from_raw_parts_mut(&mut bcmd as *mut _ as *mut u8, core::mem::size_of::<crate::ipc::protocol::HwBreakpointCmd>());
+            if let Err(err) = crate::mm::copy_from_user(bcmd_slice, user_ptr) {
+                err as i64
+            } else {
+                if cmd == crate::ipc::protocol::OP_ENABLE_HW_BREAKPOINT {
+                    match crate::hwbp::core::enable_hwbp(bcmd.pid, bcmd.addr) {
+                        Ok(_) => 0,
+                        Err(err) => err as i64,
+                    }
+                } else {
+                    match crate::hwbp::core::disable_hwbp(bcmd.pid, bcmd.addr) {
+                        Ok(_) => 0,
+                        Err(err) => err as i64,
+                    }
+                }
+            }
+        }
+        crate::ipc::protocol::OP_QUERY_HW_BREAKPOINT_STATUS => {
+            let mut qcmd = core::mem::zeroed::<crate::ipc::protocol::HwbpQueryCmd>();
+            let qcmd_slice = core::slice::from_raw_parts_mut(&mut qcmd as *mut _ as *mut u8, core::mem::size_of::<crate::ipc::protocol::HwbpQueryCmd>());
+            if let Err(err) = crate::mm::copy_from_user(qcmd_slice, user_ptr) {
+                err as i64
+            } else {
+                match crate::hwbp::core::query_hwbp_status(qcmd.pid, qcmd.addr, &mut qcmd) {
+                    Ok(_) => {
+                        if let Err(err) = crate::mm::copy_to_user(user_ptr as *mut c_void, qcmd.as_bytes()) {
                             err as i64
                         } else {
                             0

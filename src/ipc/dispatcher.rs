@@ -2,7 +2,10 @@
 
 use crate::mm::{read_process_memory, write_process_memory};
 use crate::mm::ghost::{ghost_alloc, ghost_free, ghost_write, ghost_sync_icache, GhostPage};
-use crate::hwbp::core::{register_hwbp, unregister_hwbp, unregister_all_hwbp, read_hwbp_info};
+use crate::hwbp::core::{
+    register_hwbp, unregister_hwbp, unregister_all_hwbp, read_hwbp_info,
+    get_hwbp_caps, enable_hwbp, disable_hwbp, query_hwbp_status,
+};
 use crate::ipc::protocol::*;
 use crate::utils::Error;
 use crate::sync::RawSpinlock;
@@ -148,6 +151,52 @@ pub unsafe fn rwbp_dispatch(shm: *mut ShmChannel) -> i64 {
                 ) {
                     Ok(_) => {
                         shm_ref.data_size = (actual_count * core::mem::size_of::<HwbpHitItem>() as u64) as u32;
+                        0
+                    }
+                    Err(err) => err as i64,
+                }
+            }
+            OP_GET_HW_BREAKPOINT_CAPS => {
+                let (brps, wrps) = unsafe { get_hwbp_caps() };
+                let caps = HwbpCaps {
+                    max_breakpoints: brps,
+                    max_watchpoints: wrps,
+                };
+                shm_ref.data_size = core::mem::size_of::<HwbpCaps>() as u32;
+                use zerocopy::IntoBytes;
+                shm_ref.payload[..core::mem::size_of::<HwbpCaps>()].copy_from_slice(caps.as_bytes());
+                0
+            }
+            OP_ENABLE_HW_BREAKPOINT => {
+                let Ok((bcmd, _)) = HwBreakpointCmd::read_from_prefix(&shm_ref.payload[..]) else {
+                    return Error::EINVAL as i64;
+                };
+
+                match enable_hwbp(bcmd.pid, bcmd.addr) {
+                    Ok(_) => 0,
+                    Err(err) => err as i64,
+                }
+            }
+            OP_DISABLE_HW_BREAKPOINT => {
+                let Ok((bcmd, _)) = HwBreakpointCmd::read_from_prefix(&shm_ref.payload[..]) else {
+                    return Error::EINVAL as i64;
+                };
+
+                match disable_hwbp(bcmd.pid, bcmd.addr) {
+                    Ok(_) => 0,
+                    Err(err) => err as i64,
+                }
+            }
+            OP_QUERY_HW_BREAKPOINT_STATUS => {
+                let Ok((mut qcmd, _)) = HwbpQueryCmd::read_from_prefix(&shm_ref.payload[..]) else {
+                    return Error::EINVAL as i64;
+                };
+
+                match query_hwbp_status(qcmd.pid, qcmd.addr, &mut qcmd) {
+                    Ok(_) => {
+                        shm_ref.data_size = core::mem::size_of::<HwbpQueryCmd>() as u32;
+                        use zerocopy::IntoBytes;
+                        shm_ref.payload[..core::mem::size_of::<HwbpQueryCmd>()].copy_from_slice(qcmd.as_bytes());
                         0
                     }
                     Err(err) => err as i64,

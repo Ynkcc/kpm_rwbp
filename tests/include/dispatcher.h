@@ -20,6 +20,10 @@ long kpm_ipc_cmd(int fd, unsigned int cmd, void *arg);
 #define OP_REMOVE_HW_BREAKPOINT      8013
 #define OP_REMOVE_ALL_HW_BREAKPOINT  8014
 #define OP_READ_HW_BP_INFO           8015  // 新增：读取断点命中信息
+#define OP_GET_HW_BREAKPOINT_CAPS    8016
+#define OP_ENABLE_HW_BREAKPOINT     8017
+#define OP_DISABLE_HW_BREAKPOINT    8018
+#define OP_QUERY_HW_BREAKPOINT_STATUS 8019
 #define OP_GHOST_ALLOC               8021
 #define OP_GHOST_FREE                8022
 #define OP_GHOST_WRITE               8023
@@ -110,5 +114,23 @@ typedef struct {
 
 // 核心分发入口定义
 long rwbp_dispatch(shm_channel_t *shm);
+
+// 硬件调试能力结构体
+typedef struct {
+    uint32_t max_breakpoints;
+    uint32_t max_watchpoints;
+} hwbp_caps_t;
+
+// 硬件调试状态查询命令结构体
+typedef struct {
+    uint32_t pid;
+    uint32_t _pad0;
+    uint64_t addr;
+    uint32_t active;
+    uint32_t bp_type;
+    uint32_t len;
+    uint32_t scheme;
+    uint64_t hit_count;
+} hwbp_query_cmd_t;
 
 #endif // __DISPATCHER_H__

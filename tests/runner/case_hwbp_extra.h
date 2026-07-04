@@ -19,4 +19,12 @@ bool run_case_hwbp_scale(int anon_fd);
  */
 bool run_case_hwbp_concurrency(int anon_fd);
 
+/**
+ * 运行新增/调整的硬件断点基本接口测试（获取硬件能力、注册并激活、禁用、重新启用、状态查询）
+ *
+ * @param anon_fd    匿名控制 FD
+ * @return           成功返回 true，失败返回 false
+ */
+bool run_case_hwbp_interfaces(int anon_fd);
+
 #endif // CASE_HWBP_EXTRA_H

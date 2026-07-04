@@ -122,3 +122,34 @@ long kpm_read_mem_array(uint32_t pid, uint64_t array_vaddr, uint64_t count,
     // 在用户态，数组是连续分布的，仅需一次读取即可
     return kpm_read_mem(pid, array_vaddr, dest, count * item_size);
 }
+
+long kpm_get_hwbp_caps(int fd, hwbp_caps_t *caps)
+{
+    return kpm_ipc_cmd(fd, OP_GET_HW_BREAKPOINT_CAPS, caps);
+}
+
+long kpm_enable_hwbp(int fd, uint32_t pid, uint64_t addr)
+{
+    hw_breakpoint_cmd_t bcmd;
+    memset(&bcmd, 0, sizeof(bcmd));
+    bcmd.pid = pid;
+    bcmd.addr = addr;
+    return kpm_ipc_cmd(fd, OP_ENABLE_HW_BREAKPOINT, &bcmd);
+}
+
+long kpm_disable_hwbp(int fd, uint32_t pid, uint64_t addr)
+{
+    hw_breakpoint_cmd_t bcmd;
+    memset(&bcmd, 0, sizeof(bcmd));
+    bcmd.pid = pid;
+    bcmd.addr = addr;
+    return kpm_ipc_cmd(fd, OP_DISABLE_HW_BREAKPOINT, &bcmd);
+}
+
+long kpm_query_hwbp_status(int fd, uint32_t pid, uint64_t addr, hwbp_query_cmd_t *qcmd)
+{
+    memset(qcmd, 0, sizeof(hwbp_query_cmd_t));
+    qcmd->pid = pid;
+    qcmd->addr = addr;
+    return kpm_ipc_cmd(fd, OP_QUERY_HW_BREAKPOINT_STATUS, qcmd);
+}

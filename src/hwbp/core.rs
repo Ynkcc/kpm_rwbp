@@ -1110,3 +1110,162 @@ pub fn read_hwbp_info(
     *actual_count = count_to_copy as u64;
     Ok(())
 }
+
+/// 获取当前 CPU 架构真正支持的硬件断点和观察点最大数量
+pub unsafe fn get_hwbp_caps() -> (u32, u32) {
+    let mut val: u64 = 0;
+    unsafe {
+        core::arch::asm!("mrs {}, id_aa64dfr0_el1", out(reg) val);
+    }
+    let brps = ((val >> 12) & 0xf) as u32 + 1;
+    let wrps = ((val >> 20) & 0xf) as u32 + 1;
+    (brps, wrps)
+}
+
+/// 启用已注册但被禁用的硬件断点
+pub fn enable_hwbp(pid: u32, addr: u64) -> Result<(), Error> {
+    let mut target_node: *mut HwbpNode = core::ptr::null_mut();
+    
+    let guard = BP_LIST_LOCK.lock();
+    let bp_list_ptr = BP_LIST.get_ptr();
+    let mut curr = unsafe { (*bp_list_ptr).next };
+    while curr != bp_list_ptr {
+        let node_offset = core::mem::offset_of!(HwbpNode, list);
+        let node = (curr as usize - node_offset) as *mut HwbpNode;
+        if unsafe { (*node).pid == pid && (*node).addr == addr } {
+            if unsafe { !(*node).active.load(Ordering::Acquire) } {
+                unsafe { (*node).active.store(true, Ordering::Release) };
+                target_node = node;
+            }
+            break;
+        }
+        curr = unsafe { (*curr).next };
+    }
+    drop(guard);
+
+    if target_node.is_null() {
+        return Err(Error::ENOENT);
+    }
+
+    unsafe {
+        match (*target_node).scheme {
+            1 => {
+                if (*target_node).is_waiting_return.load(Ordering::Acquire) {
+                    (*target_node).is_waiting_return.store(false, Ordering::Release);
+                }
+                if let Some(modify_fn) = crate::sym!(modify_user_hw_breakpoint) {
+                    let mut orig_attr = (*target_node).orig_attr;
+                    orig_attr.set_disabled(false);
+                    modify_fn((*target_node).bp, &mut orig_attr);
+                }
+                if let Some(enable_fn) = crate::sym!(perf_event_enable) {
+                    enable_fn((*target_node).bp);
+                }
+            }
+            2 => {
+                if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
+                    on_each_cpu(write_wp_regs_on_cpu, target_node as *mut c_void, 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// 禁用（暂停）已注册的硬件断点
+pub fn disable_hwbp(pid: u32, addr: u64) -> Result<(), Error> {
+    let mut target_node: *mut HwbpNode = core::ptr::null_mut();
+
+    let guard = BP_LIST_LOCK.lock();
+    let bp_list_ptr = BP_LIST.get_ptr();
+    let mut curr = unsafe { (*bp_list_ptr).next };
+    while curr != bp_list_ptr {
+        let node_offset = core::mem::offset_of!(HwbpNode, list);
+        let node = (curr as usize - node_offset) as *mut HwbpNode;
+        if unsafe { (*node).pid == pid && (*node).addr == addr } {
+            if unsafe { (*node).active.load(Ordering::Acquire) } {
+                unsafe { (*node).active.store(false, Ordering::Release) };
+                target_node = node;
+            }
+            break;
+        }
+        curr = unsafe { (*curr).next };
+    }
+    drop(guard);
+
+    if target_node.is_null() {
+        return Err(Error::ENOENT);
+    }
+
+    unsafe {
+        match (*target_node).scheme {
+            1 => {
+                if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
+                    disable_fn((*target_node).bp);
+                }
+                if (*target_node).is_waiting_return.load(Ordering::Acquire) {
+                    (*target_node).is_waiting_return.store(false, Ordering::Release);
+                }
+                if let Some(modify_fn) = crate::sym!(modify_user_hw_breakpoint) {
+                    let mut orig_attr = (*target_node).orig_attr;
+                    orig_attr.set_disabled(true);
+                    modify_fn((*target_node).bp, &mut orig_attr);
+                }
+            }
+            2 => {
+                let mut has_other_active_scheme2 = false;
+                let guard = BP_LIST_LOCK.lock();
+                let mut curr = (*bp_list_ptr).next;
+                while curr != bp_list_ptr {
+                    let node_offset = core::mem::offset_of!(HwbpNode, list);
+                    let other_node = (curr as usize - node_offset) as *mut HwbpNode;
+                    if other_node != target_node && (*other_node).scheme == 2 && (*other_node).active.load(Ordering::Acquire) {
+                        has_other_active_scheme2 = true;
+                        break;
+                    }
+                    curr = (*curr).next;
+                }
+                drop(guard);
+
+                if !has_other_active_scheme2 {
+                    if let Some(on_each_cpu) = crate::sym!(on_each_cpu) {
+                        on_each_cpu(disable_wp_regs_on_cpu, core::ptr::null_mut(), 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// 查询硬件断点当前状态
+pub fn query_hwbp_status(
+    pid: u32,
+    addr: u64,
+    out_info: &mut crate::ipc::protocol::HwbpQueryCmd,
+) -> Result<(), Error> {
+    let guard = BP_LIST_LOCK.lock();
+    let bp_list_ptr = BP_LIST.get_ptr();
+    let mut curr = unsafe { (*bp_list_ptr).next };
+    while curr != bp_list_ptr {
+        let node_offset = core::mem::offset_of!(HwbpNode, list);
+        let node = (curr as usize - node_offset) as *mut HwbpNode;
+        if unsafe { (*node).pid == pid && (*node).addr == addr } {
+            out_info.active = if unsafe { (*node).active.load(Ordering::Acquire) } { 1 } else { 0 };
+            out_info.bp_type = unsafe { (*node).bp_type };
+            out_info.len = unsafe { (*node).len };
+            out_info.scheme = unsafe { (*node).scheme };
+            out_info.hit_count = unsafe { (*node).hit_count.load(Ordering::Relaxed) };
+            drop(guard);
+            return Ok(());
+        }
+        curr = unsafe { (*curr).next };
+    }
+    drop(guard);
+    Err(Error::ENOENT)
+}
+

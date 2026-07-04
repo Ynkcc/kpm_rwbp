@@ -9,6 +9,10 @@ pub const OP_SET_HW_BREAKPOINT: u32 = 8011;
 pub const OP_REMOVE_HW_BREAKPOINT: u32 = 8013;
 pub const OP_REMOVE_ALL_HW_BREAKPOINT: u32 = 8014;
 pub const OP_READ_HW_BP_INFO: u32 = 8015;
+pub const OP_GET_HW_BREAKPOINT_CAPS: u32 = 8016;
+pub const OP_ENABLE_HW_BREAKPOINT: u32 = 8017;
+pub const OP_DISABLE_HW_BREAKPOINT: u32 = 8018;
+pub const OP_QUERY_HW_BREAKPOINT_STATUS: u32 = 8019;
 pub const OP_GHOST_ALLOC: u32 = 8021;
 pub const OP_GHOST_FREE: u32 = 8022;
 pub const OP_GHOST_WRITE: u32 = 8023;
@@ -121,3 +125,26 @@ pub struct GhostWriteCmd {
     pub size: u32,
     pub buffer: u64,
 }
+
+/// 硬件调试能力结构体
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
+pub struct HwbpCaps {
+    pub max_breakpoints: u32,
+    pub max_watchpoints: u32,
+}
+
+/// 硬件调试状态查询命令结构体
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
+pub struct HwbpQueryCmd {
+    pub pid: u32,
+    pub _pad0: u32,
+    pub addr: u64,
+    pub active: u32,
+    pub bp_type: u32,
+    pub len: u32,
+    pub scheme: u32,
+    pub hit_count: u64,
+}
+

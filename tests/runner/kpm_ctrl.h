@@ -34,4 +34,16 @@ long kpm_read_mem_list(uint32_t pid, uint64_t base_addr, const uint64_t *addrs, 
 long kpm_read_mem_array(uint32_t pid, uint64_t array_vaddr, uint64_t count,
                         void *dest, uint64_t item_size);
 
+// 获取硬件调试能力
+long kpm_get_hwbp_caps(int fd, hwbp_caps_t *caps);
+
+// 启用已注册的硬件断点
+long kpm_enable_hwbp(int fd, uint32_t pid, uint64_t addr);
+
+// 禁用已注册的硬件断点
+long kpm_disable_hwbp(int fd, uint32_t pid, uint64_t addr);
+
+// 查询硬件断点状态
+long kpm_query_hwbp_status(int fd, uint32_t pid, uint64_t addr, hwbp_query_cmd_t *qcmd);
+
 #endif // KPM_CTRL_H

@@ -24,7 +24,7 @@ typedef struct {
 static void print_usage(const char *prog)
 {
     printf("用法: %s [OPTIONS]\n", prog);
-    printf("  --case <name>     all | mem | mem-write | mem-list | mem-array | hwbp-self | hwbp-target | hwbp-scale | hwbp-concurrency | ghost  (默认: all)\n");
+    printf("  --case <name>     all | mem | mem-write | mem-list | mem-array | hwbp-self | hwbp-target | hwbp-scale | hwbp-concurrency | hwbp-interfaces | ghost  (默认: all)\n");
     printf("  --scheme <n>      HWBP 方案 1-2，0=全部运行  (默认: 0)\n");
     printf("  --timeout <ms>    单个断点方案超时时间 ms  (默认: 3000)\n");
     printf("  --help\n");
@@ -117,6 +117,7 @@ int main(int argc, char *argv[])
     bool do_target    = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-target") == 0);
     bool do_scale     = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-scale") == 0);
     bool do_concurrency = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-concurrency") == 0);
+    bool do_interfaces = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-interfaces") == 0);
     bool do_ghost     = (strcmp(run_case, "all") == 0 || strcmp(run_case, "ghost") == 0);
 
     // case: mem_read
@@ -191,6 +192,14 @@ int main(int argc, char *argv[])
         printf("[*] ========== 运行 case: hwbp_concurrency ==========\n");
         bool ok = run_case_hwbp_concurrency(anon_fd);
         results[result_count++] = (test_result_t){ "hwbp_concurrency", ok };
+        printf("\n");
+    }
+
+    // case: hwbp_interfaces
+    if (do_interfaces) {
+        printf("[*] ========== 运行 case: hwbp_interfaces ==========\n");
+        bool ok = run_case_hwbp_interfaces(anon_fd);
+        results[result_count++] = (test_result_t){ "hwbp_interfaces", ok };
         printf("\n");
     }
 
