@@ -84,6 +84,7 @@ pub struct HwbpNode {
     pub hit_record_head: AtomicU64, // 写入游标 (单调递增)
     pub hit_record_tail: AtomicU64, // 读取游标 (单调递增)
     pub active: AtomicBool,
+    pub is_waiting_return: AtomicBool,
 }
 
 impl Drop for HwbpNode {
@@ -470,6 +471,44 @@ pub unsafe extern "C" fn before_watchpoint_handler(args: *mut HookFargs3, _udata
     }
 }
 
+/// 辅助函数：将硬件断点命中的 CPU 寄存器上下文安全写入环形记录缓冲区
+unsafe fn save_hit_record(node: *mut HwbpNode, pt_regs: *const PtRegs) {
+    if pt_regs.is_null() {
+        return;
+    }
+    unsafe {
+        let head = (*node).hit_record_head.fetch_add(1, Ordering::Acquire);
+        let idx = (head % 16) as usize;
+        let rec = &mut (*node).hit_records[idx];
+        let seq_atom = &(*node).hit_record_seqs[idx];
+
+        let seq = seq_atom.load(Ordering::Relaxed).wrapping_add(1);
+        seq_atom.store(seq, Ordering::Release);
+        crate::sync::smp_wmb();
+
+        let task = get_current();
+        let pid_fn = crate::sym_must!(__task_pid_nr_ns);
+        rec.task_id = pid_fn(task, 0, core::ptr::null_mut()) as u32;
+        rec.hit_addr = (*node).addr;
+        let pt_regs_ref = &*pt_regs;
+        rec.regs_info.pc = pt_regs_ref.pc;
+        rec.regs_info.sp = pt_regs_ref.sp;
+        rec.regs_info.pstate = pt_regs_ref.pstate;
+        rec.regs_info.regs.copy_from_slice(&pt_regs_ref.regs[..31]);
+
+        if let Some(mono_ns_fn) = crate::sym!(ktime_get_mono_fast_ns) {
+            let t = mono_ns_fn();
+            rec.hit_time = if t == 0 { 1 } else { t };
+        } else {
+            rec.hit_time = 1;
+        }
+
+        crate::sync::smp_wmb();
+
+        seq_atom.store(seq.wrapping_add(1), Ordering::Release);
+    }
+}
+
 /// 硬件调试断点（perf_event）触发的回调函数
 unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *mut c_void) {
     unsafe {
@@ -498,105 +537,120 @@ unsafe extern "C" fn hwbp_triggered(bp: *mut c_void, _data: *mut c_void, regs: *
             return;
         }
 
-        if (*found_node).scheme == 1 && (*found_node).is_temp_bp.load(Ordering::Acquire) {
-            let _ = KernelArc::from_raw_transferred(found_node);
-            return;
-        }
+        let modify_fn = crate::sym!(modify_user_hw_breakpoint);
+        let enable_fn = crate::sym!(perf_event_enable);
+        let disable_fn = crate::sym!(perf_event_disable_inatomic);
 
-        (*found_node).hit_count.fetch_add(1, Ordering::Relaxed);
+        let use_state_machine = modify_fn.is_some() && enable_fn.is_some() && disable_fn.is_some();
 
-        if !pt_regs.is_null() {
-            let head = (*found_node).hit_record_head.fetch_add(1, Ordering::Acquire);
-            let idx = (head % 16) as usize;
-            let rec = &mut (*found_node).hit_records[idx];
-            let seq_atom = &(*found_node).hit_record_seqs[idx];
+        if (*found_node).scheme == 1 && use_state_machine {
+            // ================== 双向振荡状态机路径 (并发安全且零时滞漏点) ==================
+            let modify_fn = modify_fn.unwrap();
+            let enable_fn = enable_fn.unwrap();
+            let disable_fn = disable_fn.unwrap();
 
-            let seq = seq_atom.load(Ordering::Relaxed).wrapping_add(1);
-            seq_atom.store(seq, Ordering::Release);
-            crate::sync::smp_wmb();
+            let is_waiting_ret = (*found_node).is_waiting_return.load(Ordering::Acquire);
 
-            let task = get_current();
-            let pid_fn = crate::sym_must!(__task_pid_nr_ns);
-            rec.task_id = pid_fn(task, 0, core::ptr::null_mut()) as u32;
-            rec.hit_addr = (*found_node).addr;
-            let pt_regs_ref = &*pt_regs;
-            rec.regs_info.pc = pt_regs_ref.pc;
-            rec.regs_info.sp = pt_regs_ref.sp;
-            rec.regs_info.pstate = pt_regs_ref.pstate;
-            rec.regs_info.regs.copy_from_slice(&pt_regs_ref.regs[..31]);
+            if !is_waiting_ret {
+                // --- A. 函数入口触发 ---
+                (*found_node).hit_count.fetch_add(1, Ordering::Relaxed);
+                save_hit_record(found_node, pt_regs);
 
-            if let Some(mono_ns_fn) = crate::sym!(ktime_get_mono_fast_ns) {
-                let t = mono_ns_fn();
-                rec.hit_time = if t == 0 { 1 } else { t };
+                if !pt_regs.is_null() {
+                    let raw_lr = (*pt_regs).regs[30];
+                    let stripped_lr = raw_lr & 0x0000_FFFF_FFFF_FFFFu64;
+
+                    if stripped_lr != 0 {
+                        // 动态切换断点为当前线程返回地址 LR
+                        let mut next_attr = (*found_node).orig_attr;
+                        next_attr.bp_addr = stripped_lr;
+                        next_attr.bp_len = 4;
+                        next_attr.bp_type = 4;
+                        next_attr.set_disabled(false);
+
+                        (*found_node).is_waiting_return.store(true, Ordering::Release);
+
+                        disable_fn(bp);
+                        modify_fn(bp, &mut next_attr);
+                        enable_fn(bp);
+
+                        pr_info!("状态机: 断点改至 LR 0x{:x}", stripped_lr);
+                    }
+                }
             } else {
-                rec.hit_time = 1;
+                // --- B. 函数返回 (LR) 触发 ---
+                // 再次写入记录（此时的 X0 即为返回值，PC 为返回后的地址）
+                save_hit_record(found_node, pt_regs);
+
+                // 还原断点地址为原始入口
+                let mut orig_attr = (*found_node).orig_attr;
+                orig_attr.set_disabled(false);
+
+                (*found_node).is_waiting_return.store(false, Ordering::Release);
+
+                disable_fn(bp);
+                modify_fn(bp, &mut orig_attr);
+                enable_fn(bp);
+
+                pr_info!("状态机: 断点还原至入口 0x{:x}", (*found_node).addr);
+            }
+        } else {
+            // ================== 原有降级恢复与其它方案路径 ==================
+            if (*found_node).scheme == 1 && (*found_node).is_temp_bp.load(Ordering::Acquire) {
+                let _ = KernelArc::from_raw_transferred(found_node);
+                return;
             }
 
-            crate::sync::smp_wmb();
+            (*found_node).hit_count.fetch_add(1, Ordering::Relaxed);
+            save_hit_record(found_node, pt_regs);
 
-            seq_atom.store(seq.wrapping_add(1), Ordering::Release);
-        }
+            pr_info!("=== 硬件断点命中 (非状态机/降级模式) ===");
+            pr_info!(
+                "PID: {}, 地址: 0x{:x}, 命中次数: {}",
+                (*found_node).pid,
+                (*found_node).addr,
+                (*found_node).hit_count.load(Ordering::Relaxed)
+            );
+            pr_info!("PC 地址: 0x{:x}", if pt_regs.is_null() { 0 } else { (*pt_regs).pc });
 
-        pr_info!("=== 硬件断点命中 ===");
-        pr_info!(
-            "PID: {}, 地址: 0x{:x}, 命中次数: {}",
-            (*found_node).pid,
-            (*found_node).addr,
-            (*found_node).hit_count.load(Ordering::Relaxed)
-        );
-        pr_info!("PC 地址: 0x{:x}", if pt_regs.is_null() { 0 } else { (*pt_regs).pc });
+            #[cfg(feature = "dump_stack")]
+            if let Some(dump_fn) = crate::sym!(dump_stack) {
+                dump_fn();
+            }
 
-        #[cfg(feature = "dump_stack")]
-        if let Some(dump_fn) = crate::sym!(dump_stack) {
-            dump_fn();
-        }
-
-        let mut ref_transferred = false;
-        match (*found_node).scheme {
-            1 => {
-                if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
-                    disable_fn(bp);
+            let mut ref_transferred = false;
+            match (*found_node).scheme {
+                1 => {
+                    if let Some(dis_fn) = disable_fn {
+                        dis_fn(bp);
+                    }
+                    (*found_node).is_temp_bp.store(true, Ordering::Release);
+                    if let Some(queue_fn) = crate::sym!(queue_work_on) {
+                        let ret = queue_fn(
+                            0,
+                            crate::sym!(system_wq),
+                            &mut (*found_node).recovery_work as *mut _ as *mut c_void,
+                        );
+                        if ret != 0 {
+                            ref_transferred = true;
+                        }
+                    }
                 }
-                (*found_node).is_temp_bp.store(true, Ordering::Release);
-                if let Some(queue_fn) = crate::sym!(queue_work_on) {
-                    let ret = queue_fn(
-                        0,
-                        crate::sym!(system_wq),
-                        &mut (*found_node).recovery_work as *mut _ as *mut c_void,
-                    );
-                    if ret != 0 {
-                        ref_transferred = true;
+                _ => {
+                    toggle_bp_registers_directly((*found_node).addr, (*found_node).bp_type, (*found_node).len, false);
+                    if let Some(dis_fn) = disable_fn {
+                        dis_fn(bp);
                     }
                 }
             }
-            999 => {
-                pr_warn!("Scheme 999 触发。当前方案已安全降级为工作队列延时恢复，防止 atomic 上下文睡眠。");
-                if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
-                    disable_fn(bp);
-                }
-                (*found_node).is_temp_bp.store(true, Ordering::Release);
-                if let Some(queue_fn) = crate::sym!(queue_work_on) {
-                    let ret = queue_fn(
-                        0,
-                        crate::sym!(system_wq),
-                        &mut (*found_node).recovery_work as *mut _ as *mut c_void,
-                    );
-                    if ret != 0 {
-                        ref_transferred = true;
-                    }
-                }
-            }
-            _ => {
-                toggle_bp_registers_directly((*found_node).addr, (*found_node).bp_type, (*found_node).len, false);
-                if let Some(disable_fn) = crate::sym!(perf_event_disable_inatomic) {
-                    disable_fn(bp);
-                }
+
+            if !ref_transferred {
+                let _ = KernelArc::from_raw_transferred(found_node);
+                return;
             }
         }
 
-        if !ref_transferred {
-            let _ = KernelArc::from_raw_transferred(found_node);
-        }
+        let _ = KernelArc::from_raw_transferred(found_node);
     }
 }
 
@@ -704,6 +758,7 @@ pub fn register_hwbp(
                 (*node_raw).scheme = 2;
                 (*node_raw).active.store(true, Ordering::Release);
                 (*node_raw).recovery_work.init(recovery_bp_work_func);
+                (*node_raw).is_waiting_return = AtomicBool::new(false);
 
                 let guard = BP_LIST_LOCK.lock();
                 let bp_list_ptr = BP_LIST.get_ptr();
@@ -771,6 +826,7 @@ pub fn register_hwbp(
                 (*node_raw).orig_attr = attr;
                 (*node_raw).active.store(true, Ordering::Release);
                 (*node_raw).recovery_work.init(recovery_bp_work_func);
+                (*node_raw).is_waiting_return = AtomicBool::new(false);
 
                 let guard = BP_LIST_LOCK.lock();
                 let bp_list_ptr = BP_LIST.get_ptr();

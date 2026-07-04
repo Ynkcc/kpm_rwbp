@@ -38,6 +38,9 @@ pub unsafe fn syscall_set_handled(hook_fargs: *mut c_void, handled: bool) { unsa
 pub unsafe fn handle_cleanup() {
     pr_info!("控制端进程已退出，开始自动清理内核资源...");
     let _ = crate::hwbp::core::unregister_all_hwbp();
+    unsafe {
+        crate::ipc::dispatcher::cleanup_ghost_pool();
+    }
     SHM_USER_VADDR.store(0, Ordering::SeqCst);
 }
 
@@ -149,6 +152,25 @@ pub unsafe extern "C" fn rwbp_fstatfs_hook(args: *mut crate::ffi::hook_fargs4_t,
                     }
                     Err(err) => err as i64,
                 }
+            }
+        }
+        crate::ipc::protocol::OP_GHOST_ALLOC |
+        crate::ipc::protocol::OP_GHOST_FREE |
+        crate::ipc::protocol::OP_GHOST_WRITE => {
+            let copy_size = match cmd {
+                crate::ipc::protocol::OP_GHOST_ALLOC => core::mem::size_of::<crate::ipc::protocol::GhostAllocCmd>(),
+                crate::ipc::protocol::OP_GHOST_FREE => core::mem::size_of::<crate::ipc::protocol::GhostFreeCmd>(),
+                crate::ipc::protocol::OP_GHOST_WRITE => core::mem::size_of::<crate::ipc::protocol::GhostWriteCmd>(),
+                _ => 0,
+            };
+            let mut shm_temp = core::mem::zeroed::<crate::ipc::protocol::ShmChannel>();
+            shm_temp.magic = crate::ipc::protocol::SHM_MAGIC;
+            shm_temp.cmd = cmd;
+            let payload_slice = core::slice::from_raw_parts_mut(shm_temp.payload.as_mut_ptr(), copy_size);
+            if let Err(err) = crate::mm::copy_from_user(payload_slice, user_ptr) {
+                err as i64
+            } else {
+                crate::ipc::dispatcher::rwbp_dispatch(&mut shm_temp)
             }
         }
         _ => -22, // -EINVAL

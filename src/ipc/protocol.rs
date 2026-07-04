@@ -9,6 +9,9 @@ pub const OP_SET_HW_BREAKPOINT: u32 = 8011;
 pub const OP_REMOVE_HW_BREAKPOINT: u32 = 8013;
 pub const OP_REMOVE_ALL_HW_BREAKPOINT: u32 = 8014;
 pub const OP_READ_HW_BP_INFO: u32 = 8015;
+pub const OP_GHOST_ALLOC: u32 = 8021;
+pub const OP_GHOST_FREE: u32 = 8022;
+pub const OP_GHOST_WRITE: u32 = 8023;
 
 // 共享内存标识魔数 'SHMC'
 pub const SHM_MAGIC: u32 = 0x53484d43;
@@ -89,4 +92,32 @@ pub struct ShmChannel {
     pub data_size: u32,
     pub _pad: u32,
     pub payload: [u8; 3500],
+}
+
+/// Ghost 内存分配指令请求包
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
+pub struct GhostAllocCmd {
+    pub pid: u32,
+    pub num_pages: u32,
+    pub near_addr: u64,
+    pub range: u64,
+    pub pte_template: u64,
+}
+
+/// Ghost 内存释放指令请求包
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
+pub struct GhostFreeCmd {
+    pub vaddr: u64,
+}
+
+/// Ghost 内存写入指令请求包
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
+pub struct GhostWriteCmd {
+    pub vaddr: u64,
+    pub offset: u32,
+    pub size: u32,
+    pub buffer: u64,
 }

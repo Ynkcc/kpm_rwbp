@@ -161,6 +161,9 @@ pub unsafe extern "C" fn rwbp_exit(_reserved: *mut c_void) -> i64 {
             }
         }
 
+        // 清理所有的 Ghost 内存，防范物理页泄漏
+        crate::ipc::dispatcher::cleanup_ghost_pool();
+ 
         // 重新获取 RCU 读锁，以满足 KernelPatch 卸载框架外层对 rcu_read_unlock() 的对称调用
         if let Some(rcu_read_lock_fn) = crate::sym!(rcu_read_lock) {
             rcu_read_lock_fn();

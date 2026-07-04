@@ -8,6 +8,7 @@ use zerocopy::{Immutable, KnownLayout};
 
 pub mod offsets;
 pub mod symbols;
+pub mod routing;
 
 pub use offsets::{TaskStructOffset, CredOffset, MmStructOffset};
 pub use symbols::{

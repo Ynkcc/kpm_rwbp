@@ -266,6 +266,20 @@ pub struct KernelSymbols {
     pub watchpoint_handler_install_hook_helper: Option<unsafe extern "C" fn()>,
     pub watchpoint_handler: Option<*mut c_void>,
 
+    // Ghost Memory 分配与释放相关
+    pub __get_free_pages: Option<unsafe extern "C" fn(gfp_mask: u32, order: u32) -> u64>,
+    pub free_pages: Option<unsafe extern "C" fn(addr: u64, order: u32)>,
+    pub find_vma: Option<unsafe extern "C" fn(mm: *mut c_void, addr: u64) -> *mut c_void>,
+    pub apply_to_page_range: Option<
+        unsafe extern "C" fn(
+            mm: *mut c_void,
+            address: u64,
+            size: u64,
+            fn_cb: *mut c_void,
+            data: *mut c_void,
+        ) -> c_int,
+    >,
+
     // 工作队列和页信息 - 直接存储类型（不使用 Option），通过 null/0 判断
     pub system_wq: *mut c_void,
     pub page_size: i64,
@@ -313,6 +327,10 @@ pub static mut SYMS: KernelSymbols = KernelSymbols {
     rcu_read_unlock: None,
     watchpoint_handler_install_hook_helper: None,
     watchpoint_handler: None,
+    __get_free_pages: None,
+    free_pages: None,
+    find_vma: None,
+    apply_to_page_range: None,
     system_wq: core::ptr::null_mut(),
     page_size: 0,
     page_shift: 0,
@@ -415,6 +433,11 @@ pub unsafe fn init_symbols() -> Result<(), Error> {
 
         (*syms_ptr).watchpoint_handler_install_hook_helper = lookup_sym("watchpoint_handler_install_hook_helper");
         (*syms_ptr).watchpoint_handler = lookup_sym("watchpoint_handler");
+
+        (*syms_ptr).__get_free_pages = lookup_sym("__get_free_pages");
+        (*syms_ptr).free_pages = lookup_sym("free_pages");
+        (*syms_ptr).find_vma = lookup_sym("find_vma");
+        (*syms_ptr).apply_to_page_range = lookup_sym("apply_to_page_range");
 
         let system_wq_sym: Option<*mut *mut c_void> = lookup_sym("system_wq");
         if let Some(sym) = system_wq_sym {

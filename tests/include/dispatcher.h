@@ -20,6 +20,28 @@ long kpm_ipc_cmd(int fd, unsigned int cmd, void *arg);
 #define OP_REMOVE_HW_BREAKPOINT      8013
 #define OP_REMOVE_ALL_HW_BREAKPOINT  8014
 #define OP_READ_HW_BP_INFO           8015  // 新增：读取断点命中信息
+#define OP_GHOST_ALLOC               8021
+#define OP_GHOST_FREE                8022
+#define OP_GHOST_WRITE               8023
+
+typedef struct {
+    uint32_t pid;
+    uint32_t num_pages;
+    uint64_t near_addr;
+    uint64_t range;
+    uint64_t pte_template;
+} ghost_alloc_cmd_t;
+
+typedef struct {
+    uint64_t vaddr;
+} ghost_free_cmd_t;
+
+typedef struct {
+    uint64_t vaddr;
+    uint32_t offset;
+    uint32_t size;
+    uint64_t buffer;
+} ghost_write_cmd_t;
 
 // 内存读取命令参数结构体
 typedef struct {
