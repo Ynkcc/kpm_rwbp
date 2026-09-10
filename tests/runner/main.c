@@ -11,6 +11,7 @@
 #include "case_hwbp_self.h"
 #include "case_hwbp_extra.h"
 #include "case_ghost.h"
+#include "case_observe.h"
 #include "../include/supercall.h"
 
 #define MAX_RESULTS  16
@@ -24,7 +25,7 @@ typedef struct {
 static void print_usage(const char *prog)
 {
     printf("用法: %s [OPTIONS]\n", prog);
-    printf("  --case <name>     all | mem | mem-write | mem-list | mem-array | hwbp-self | hwbp-target | hwbp-scale | hwbp-concurrency | hwbp-interfaces | ghost  (默认: all)\n");
+    printf("  --case <name>     all | mem | mem-write | mem-list | mem-array | hwbp-self | hwbp-target | hwbp-scale | hwbp-concurrency | hwbp-interfaces | ghost | observe-perf | observe-ptrace | observe-resolve  (默认: all, observe 系列需显式指定)\n");
     printf("  --scheme <n>      HWBP 方案 1-2，0=全部运行  (默认: 0)\n");
     printf("  --timeout <ms>    单个断点方案超时时间 ms  (默认: 3000)\n");
     printf("  --help\n");
@@ -119,6 +120,10 @@ int main(int argc, char *argv[])
     bool do_concurrency = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-concurrency") == 0);
     bool do_interfaces = (strcmp(run_case, "all") == 0 || strcmp(run_case, "hwbp-interfaces") == 0);
     bool do_ghost     = (strcmp(run_case, "all") == 0 || strcmp(run_case, "ghost") == 0);
+    // observe 系列依赖内核侧 observe hook，未并入 all，需显式指定
+    bool do_observe_perf    = (strcmp(run_case, "observe-perf") == 0);
+    bool do_observe_ptrace  = (strcmp(run_case, "observe-ptrace") == 0);
+    bool do_observe_resolve = (strcmp(run_case, "observe-resolve") == 0);
 
     // case: mem_read
     if (do_mem) {
@@ -208,6 +213,30 @@ int main(int argc, char *argv[])
         printf("[*] ========== 运行 case: ghost ==========\n");
         bool ok = run_case_ghost(anon_fd);
         results[result_count++] = (test_result_t){ "ghost", ok };
+        printf("\n");
+    }
+
+    // case: observe_perf
+    if (do_observe_perf) {
+        printf("[*] ========== 运行 case: observe_perf ==========\n");
+        bool ok = run_case_observe_perf(anon_fd);
+        results[result_count++] = (test_result_t){ "observe_perf", ok };
+        printf("\n");
+    }
+
+    // case: observe_ptrace
+    if (do_observe_ptrace) {
+        printf("[*] ========== 运行 case: observe_ptrace ==========\n");
+        bool ok = run_case_observe_ptrace(anon_fd);
+        results[result_count++] = (test_result_t){ "observe_ptrace", ok };
+        printf("\n");
+    }
+
+    // case: observe_resolve
+    if (do_observe_resolve) {
+        printf("[*] ========== 运行 case: observe_resolve ==========\n");
+        bool ok = run_case_observe_resolve(anon_fd);
+        results[result_count++] = (test_result_t){ "observe_resolve", ok };
         printf("\n");
     }
 

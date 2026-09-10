@@ -16,6 +16,7 @@ pub const OP_QUERY_HW_BREAKPOINT_STATUS: u32 = 8019;
 pub const OP_GHOST_ALLOC: u32 = 8021;
 pub const OP_GHOST_FREE: u32 = 8022;
 pub const OP_GHOST_WRITE: u32 = 8023;
+pub const OP_READ_OBSERVE_RECORDS: u32 = 8031;
 
 // 共享内存标识魔数 'SHMC'
 pub const SHM_MAGIC: u32 = 0x53484d43;
@@ -124,6 +125,40 @@ pub struct GhostWriteCmd {
     pub offset: u32,
     pub size: u32,
     pub buffer: u64,
+}
+
+/// OBSERVE 观测记录事件类型
+pub const OBSERVE_EVENT_PERF: u32 = 0;
+pub const OBSERVE_EVENT_PTRACE: u32 = 1;
+
+/// OBSERVE 单条观测记录（hook_syscalln 现场捕获，供用户态消费）
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
+pub struct ObserveRecord {
+    pub event_type: u32,
+    pub _pad0: u32,
+    pub pid: u32,
+    pub tid: u32,
+    pub bp_addr: u64,
+    pub bp_type: u64,
+    pub bp_len: u64,
+    pub caller_pc: u64,
+    pub caller_lr: u64,
+    pub path_offset: u64,
+    pub path_len: u32,
+    pub _pad1: u32,
+    pub path: [u8; 64],
+}
+
+/// 读取 OBSERVE 观测记录请求协议
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
+pub struct ObserveInfoCmd {
+    pub pid: u32,
+    pub _pad: u32,
+    pub max_count: u64,
+    pub user_buf: u64,
+    pub actual_count: u64,
 }
 
 /// 硬件调试能力结构体

@@ -27,6 +27,7 @@ long kpm_ipc_cmd(int fd, unsigned int cmd, void *arg);
 #define OP_GHOST_ALLOC               8021
 #define OP_GHOST_FREE                8022
 #define OP_GHOST_WRITE               8023
+#define OP_READ_OBSERVE_RECORDS      8031  // 新增：读取 OBSERVE 观测记录
 
 typedef struct {
     uint32_t pid;
@@ -132,5 +133,35 @@ typedef struct {
     uint32_t scheme;
     uint64_t hit_count;
 } hwbp_query_cmd_t;
+
+// OBSERVE 观测记录事件类型
+#define OBSERVE_EVENT_PERF           0
+#define OBSERVE_EVENT_PTRACE         1
+
+// 单条 OBSERVE 观测记录（与 src/ipc/protocol.rs 的 ObserveRecord 保持一致）
+typedef struct {
+    uint32_t event_type;   // OBSERVE_EVENT_*
+    uint32_t _pad0;
+    uint32_t pid;          // 发起者 PID
+    uint32_t tid;          // 发起者 TID
+    uint64_t bp_addr;      // perf: attr.bp_addr / ptrace: 槽位地址
+    uint64_t bp_type;      // perf: attr.bp_type / ptrace: NT 类型
+    uint64_t bp_len;       // perf: attr.bp_len
+    uint64_t caller_pc;    // 发起者用户态 pc
+    uint64_t caller_lr;    // 发起者用户态 lr
+    uint64_t path_offset;  // bp_addr - vma.vm_start（so 内偏移）
+    uint32_t path_len;     // path 有效长度（0 表示无法解析）
+    uint32_t _pad1;
+    char     path[64];     // d_path 结果
+} observe_record_t;
+
+// OBSERVE 观测记录读取结构体
+typedef struct {
+    uint32_t pid;             // 目标进程 PID
+    uint32_t _pad;
+    uint64_t max_count;       // 输入：最大返回条数
+    uint64_t user_buf;        // 输出：observe_record_t 数组指针
+    uint64_t actual_count;    // 输出：实际返回条数
+} observe_info_cmd_t;
 
 #endif // __DISPATCHER_H__
