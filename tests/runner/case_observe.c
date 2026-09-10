@@ -66,6 +66,45 @@ static int perf_open_bp(uint64_t bp_addr, uint32_t bp_type)
     return (int)syscall(__NR_perf_event_open, &attr, 0, -1, -1, 0);
 }
 
+// 按内核约定，pid 记为 bp_addr 归属进程；此处用 /proc/<pid>/maps 补全 path/path_offset
+static void fill_paths_from_maps(uint32_t pid, observe_record_t *records, int count)
+{
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%u/maps", pid);
+    FILE *f = fopen(maps_path, "r");
+    if (!f) {
+        printf("[-] [observe] 打开 %s 失败 errno=%d\n", maps_path, errno);
+        return;
+    }
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        uint64_t start, end;
+        char path[256];
+        path[0] = '\0';
+        // 格式: start-end perms offset dev inode pathname
+        if (sscanf(line, "%lx-%lx %*4s %*x %*x:%*x %*lu %255[^\n]",
+                   &start, &end, path) < 3)
+            continue;
+        // 去掉 pathname 前导空白
+        char *p = path;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') continue;
+
+        for (int i = 0; i < count; i++) {
+            observe_record_t *r = &records[i];
+            if (r->path_len != 0 || r->bp_addr < start || r->bp_addr >= end)
+                continue;
+            r->path_offset = r->bp_addr - start;
+            size_t plen = strlen(p);
+            if (plen > 64) plen = 64;
+            memcpy(r->path, p, plen);
+            r->path_len = (uint32_t)plen;
+        }
+    }
+    fclose(f);
+}
+
 // 拉取观测记录，返回实际条数；<0 表示内核侧未实现/命令失败
 static int fetch_observe_records(int anon_fd, uint32_t pid,
                                  observe_record_t *records, uint32_t max_count)
@@ -187,9 +226,12 @@ bool run_case_observe_ptrace(int anon_fd)
     struct user_hwdebug_state bp_state;
     memset(&bp_state, 0, sizeof(bp_state));
     bp_state.dbg_regs[0].addr = watch_addr;
-    bp_state.dbg_regs[0].ctrl = 0x1E07E1; // BAS=0xFF, PAC=3, E=1 等典型使能组合
+    // bit0=1 使能, bits5-12 BAS=0xF（执行断点合法长度）; 其余保留位清零
+    bp_state.dbg_regs[0].ctrl = 0x1 | (0xFu << 5);
 
-    struct iovec iov = { .iov_base = &bp_state, .iov_len = sizeof(bp_state) };
+    // 内核按 iov_len 推算写入槽位数，多写会导致逐槽注册断点直至 -ENOSPC；
+    // 真实调试器（GDB）按可用槽位回写，这里只写 1 个槽位: hdr(8) + addr(8)+ctrl(4)+pad(4)
+    struct iovec iov = { .iov_base = &bp_state, .iov_len = 8 + 16 };
     long ret = ptrace(PTRACE_SETREGSET, child, (void *)NT_ARM_HW_BREAK, &iov);
     printf("[*] [observe_ptrace] PTRACE_SETREGSET(NT_ARM_HW_BREAK, addr=%#lx) -> %ld\n",
            (unsigned long)watch_addr, ret);
@@ -242,6 +284,7 @@ bool run_case_observe_resolve(int anon_fd)
     observe_record_t records[8];
     int n = fetch_observe_records(anon_fd, self_pid, records, 8);
     if (n < 0) return false;
+    fill_paths_from_maps(self_pid, records, n);
 
     bool all_pass = false;
     for (int i = 0; i < n; i++) {

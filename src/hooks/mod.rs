@@ -2,4 +2,5 @@
 
 pub mod watchpoint;
 pub mod syscall;
+pub mod observe;
 

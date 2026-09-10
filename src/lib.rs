@@ -122,6 +122,11 @@ pub unsafe extern "C" fn rwbp_init(_args: *const u8, _event: *const u8, _reserve
         );
         pr_info!("hook_syscalln exit_group 返回: {}", ret_exit_group);
 
+        // 挂载 OBSERVE 观测 hook（perf_event_open / ptrace）
+        if let Err(e) = crate::hooks::observe::install_observe_hooks() {
+            pr_warn!("observe 观测 hook 挂载失败: {}，跳过（其余功能不受影响）", e);
+        }
+
         pr_info!("kpm_RWBP 初始化成功，系统调用 Hook 已就绪！");
         0
     }
@@ -143,6 +148,7 @@ pub unsafe extern "C" fn rwbp_exit(_reserved: *mut c_void) -> i64 {
             core::ptr::null(),
         );
         crate::hooks::watchpoint::remove_wp_hook();
+        crate::hooks::observe::remove_observe_hooks();
 
         // 先注销和排队清理任务，触发 IN_FLIGHT 的递增和排队
         crate::hooks::syscall::handle_cleanup();

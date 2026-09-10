@@ -154,7 +154,7 @@ Android 用户态程序，通过 `syscall(44, ptr, 0xDEADC0DE, cmd)` 与模块�
 | hwbp-self | scheme 1/2 各自自测（固定地址写入 + XOR 校验、命中记录） |
 | hwbp-target / hwbp-scale / hwbp-concurrency / hwbp-interfaces | 跨进程断点 / 规模 / 并发 / 接口面（enable/disable/query/caps） |
 | ghost | Ghost alloc/write/free 生命周期 |
-| observe-perf / observe-ptrace / observe-resolve | OBSERVE 方案 P0（perf/ptrace 下断拦截记录回读比对 / d_path 定位链路）。依赖内核侧 observe hook，需显式 `--case` 指定，未并入 all |
+| observe-perf / observe-ptrace / observe-resolve | OBSERVE 方案 P0：perf/ptrace 下断拦截记录回读比对；路径归因由 runner 经 /proc/<pid>/maps 完成。需显式 `--case` 指定，未并入 all |
 
 协议镜像：`tests/include/dispatcher.h`、`supercall.h` 与 `src/ipc/protocol.rs` 保持一致，修改命令结构体时须同步。
 
@@ -162,3 +162,4 @@ Android 用户态程序，通过 `syscall(44, ptr, 0xDEADC0DE, cmd)` 与模块�
 
 - 初始版本：生成于 rust-main 分支，覆盖 src/ 模块划分、IPC 协议（8001-8023）、hwbp scheme 1/2、mm 读写与 Ghost 机制、构建与测试流程。
 - 新增 IPC 命令码 8031（OP_READ_OBSERVE_RECORDS，`ObserveRecord`/`ObserveInfoCmd`）与 tests/runner/case_observe.c P0 骨架（observe-perf/observe-ptrace/observe-resolve）；内核侧 observe hook 尚未实现。
+- 实现 `src/hooks/observe.rs`（OBSERVE 模式）：hook_syscalln 拦截 perf_event_open(241)/ptrace(117)，捕获硬件断点行为入 64 深度环形缓冲。设计取舍：内核侧零结构体偏移（不读 vma/file，路径归因移至用户态消费端）；pid/tid 经 `__task_pid_nr_ns` 获取（KP 的 tgid/pid 偏移在部分设备未填充）；`mm_offset` 直读不可靠，跨 mm 操作一律走 `get_task_mm`+`mmput`。

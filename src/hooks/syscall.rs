@@ -155,6 +155,33 @@ pub unsafe extern "C" fn rwbp_fstatfs_hook(args: *mut crate::ffi::hook_fargs4_t,
                 }
             }
         }
+        crate::ipc::protocol::OP_READ_OBSERVE_RECORDS => {
+            let mut icmd = core::mem::zeroed::<crate::ipc::protocol::ObserveInfoCmd>();
+            let icmd_slice = core::slice::from_raw_parts_mut(&mut icmd as *mut _ as *mut u8, core::mem::size_of::<crate::ipc::protocol::ObserveInfoCmd>());
+            if let Err(err) = crate::mm::copy_from_user(icmd_slice, user_ptr) {
+                err as i64
+            } else {
+                let mut actual_count = 0;
+                match crate::hooks::observe::read_observe_records(
+                    icmd.pid,
+                    icmd.max_count,
+                    icmd.user_buf as *mut c_void,
+                    &mut actual_count,
+                ) {
+                    Ok(_) => {
+                        let actual_count_offset = core::mem::offset_of!(crate::ipc::protocol::ObserveInfoCmd, actual_count);
+                        let dest_ptr = (arg0 + actual_count_offset as u64) as *mut c_void;
+                        let src_slice = &actual_count.to_ne_bytes();
+                        if let Err(err) = crate::mm::copy_to_user(dest_ptr, src_slice) {
+                            err as i64
+                        } else {
+                            0
+                        }
+                    }
+                    Err(err) => err as i64,
+                }
+            }
+        }
         crate::ipc::protocol::OP_GET_HW_BREAKPOINT_CAPS => {
             let (brps, wrps) = crate::hwbp::core::get_hwbp_caps();
             let caps = crate::ipc::protocol::HwbpCaps {
